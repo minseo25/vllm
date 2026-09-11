@@ -352,6 +352,12 @@ class StateTracer:
                 self._finalize_locked()
 
     def _finalize_locked(self) -> None:
+        if not os.path.isdir(self._request_dir()):
+            # The runner removed this (sentinel) request's directory on purpose;
+            # do not resurrect it at shutdown.
+            self._layers = {}
+            self._manifest["complete"] = True
+            return
         self._flush_all_chunks()
         self._manifest["ended_unix"] = time.time()
         self._manifest["complete"] = True
