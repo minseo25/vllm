@@ -87,6 +87,14 @@ class MambaConfig:
     fixed set of early anchors)."""
     state_trace_max_steps: int = 8192
     """Stop recording per-step factors after this many decode updates."""
+    state_trace_snapshot_steps: list[int] | None = None
+    """Explicit decode-update anchors at which to store full state snapshots
+    (t = 0 is always stored).  Overrides ``state_trace_snapshot_every`` and the
+    built-in early anchors when set, e.g. ``[32, 128, 256, 512, 1024, 2048,
+    4096, 8192]``."""
+    state_trace_factors: bool = True
+    """Record per-step native factors and kernel readouts.  Set False for a
+    state-snapshot-only trace (much smaller; no offline replay possible)."""
 
     @field_validator("backend", mode="before")
     @classmethod

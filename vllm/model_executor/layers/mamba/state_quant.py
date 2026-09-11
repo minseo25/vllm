@@ -306,12 +306,19 @@ class StateTracer:
         max_steps: int = 8192,
         chunk_steps: int = 256,
         extra_snapshot_steps: tuple[int, ...] = (1, 2, 8, 16, 32, 64, 128),
+        snapshot_steps: tuple[int, ...] | None = None,
+        record_factors: bool = True,
     ) -> None:
         self.root = root
         self.snapshot_every = int(snapshot_every)
         self.max_steps = int(max_steps)
         self.chunk_steps = int(chunk_steps)
         self.extra_snapshot_steps = frozenset(int(x) for x in extra_snapshot_steps)
+        # Explicit anchor list (plus t = 0) overrides the periodic schedule.
+        self.snapshot_steps = (
+            None if snapshot_steps is None else frozenset(int(x) for x in snapshot_steps)
+        )
+        self.record_factors = bool(record_factors)
         self.request_index = -1
         self._layers: dict[int, _LayerTraceBuffer] = {}
         self._layer_meta: dict[int, dict[str, Any]] = {}
@@ -335,6 +342,8 @@ class StateTracer:
                 "request_index": self.request_index,
                 "started_unix": time.time(),
                 "snapshot_every": self.snapshot_every,
+                "snapshot_steps": None if self.snapshot_steps is None else sorted(self.snapshot_steps),
+                "record_factors": self.record_factors,
                 "chunk_steps": self.chunk_steps,
                 "layers": {},
                 "meta": meta or {},
@@ -374,7 +383,11 @@ class StateTracer:
 
     # -- recording ---------------------------------------------------------- #
     def should_snapshot(self, t: int) -> bool:
-        if t == 0 or t in self.extra_snapshot_steps:
+        if t == 0:
+            return True
+        if self.snapshot_steps is not None:
+            return t in self.snapshot_steps
+        if t in self.extra_snapshot_steps:
             return True
         return self.snapshot_every > 0 and t % self.snapshot_every == 0
 
@@ -429,7 +442,7 @@ class StateTracer:
 
     def record_step(self, layer: int, t: int, factors: dict[str, torch.Tensor]) -> None:
         """Append one decode step's factors (each ``[...]`` for one request)."""
-        if t > self.max_steps:
+        if not self.record_factors or t > self.max_steps:
             return
         buf = self._layers.setdefault(layer, _LayerTraceBuffer())
         for name, val in factors.items():
@@ -486,10 +499,13 @@ def get_tracer(mamba_config: Any) -> StateTracer | None:
         return None
     with _tracer_lock:
         if _tracer is None:
+            steps = getattr(mamba_config, "state_trace_snapshot_steps", None)
             _tracer = StateTracer(
                 root,
                 snapshot_every=getattr(mamba_config, "state_trace_snapshot_every", 256),
                 max_steps=getattr(mamba_config, "state_trace_max_steps", 8192),
+                snapshot_steps=None if steps is None else tuple(steps),
+                record_factors=getattr(mamba_config, "state_trace_factors", True),
             )
             import atexit
 
