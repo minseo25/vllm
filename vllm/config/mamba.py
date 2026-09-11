@@ -84,6 +84,12 @@ class MambaConfig:
     state_quant_static_scales_dir: str | None = None
     """Directory with ``layer{L:02d}.safetensors`` (key ``scale``, FP32 step
     sizes broadcastable to [heads, A, B]) for ``state_quant_scale_axis='static'``."""
+    state_quant_q0_rounding: Literal["rtn", "sr"] = "rtn"
+    """Rounding of the prefill-end checkpoint (Q0).  Kept RTN by default so RTN
+    and SR window conditions share the same initial checkpoint."""
+    state_quant_int_range: Literal["symmetric", "twos_complement"] = "symmetric"
+    """Integer code range: symmetric [-qmax, qmax] (study default) or
+    two's-complement [-2^(b-1), 2^(b-1)-1] (Quamba2's Python codec)."""
     state_quant_q0: bool = True
     """Also quantize the prefill-end checkpoint (t = 0) once."""
     state_quant_layers: list[int] | None = None
@@ -143,6 +149,10 @@ class MambaConfig:
             raise ValueError("state_quant_scale_axis must be head, dim1, dim2, rowcol or static")
         if self.state_quant_scale_axis == "static" and not self.state_quant_static_scales_dir:
             raise ValueError("state_quant_scale_axis='static' requires state_quant_static_scales_dir")
+        if self.state_quant_q0_rounding not in ("rtn", "sr"):
+            raise ValueError("state_quant_q0_rounding must be 'rtn' or 'sr'")
+        if self.state_quant_int_range not in ("symmetric", "twos_complement"):
+            raise ValueError("state_quant_int_range must be 'symmetric' or 'twos_complement'")
         if self.state_trace_snapshot_every < 0 or self.state_trace_max_steps < 0:
             raise ValueError("state_trace_* values must be non-negative")
 

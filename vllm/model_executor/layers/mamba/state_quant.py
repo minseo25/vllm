@@ -83,6 +83,13 @@ class StateQuantSpec:
     q0: bool = True
     layers: frozenset[int] | None = None
     static_scales_dir: str | None = None  # required when scale_axis == "static"
+    # The prefill-end checkpoint Q0 is always encoded with RTN so that every
+    # low-precision condition (RTN and SR windows alike) starts from the same
+    # checkpoint, as in the offline sweep; SR only affects later flushes.
+    q0_rounding: str = "rtn"
+    # Integer range: "symmetric" = [-qmax, qmax] (the study's naive codec);
+    # "twos_complement" = [-2^(b-1), 2^(b-1)-1] as in Quamba2's Python codec.
+    int_range: str = "symmetric"
 
     def __post_init__(self) -> None:
         if self.bits not in _VALID_BITS:
@@ -95,10 +102,27 @@ class StateQuantSpec:
             raise ValueError(f"state_quant_scale_axis must be one of {_VALID_SCALE_AXES}")
         if self.scale_axis == "static" and not self.static_scales_dir:
             raise ValueError("scale_axis='static' needs state_quant_static_scales_dir")
+        if self.q0_rounding not in _VALID_ROUNDING:
+            raise ValueError(f"q0_rounding must be one of {_VALID_ROUNDING}")
+        if self.int_range not in ("symmetric", "twos_complement"):
+            raise ValueError("int_range must be 'symmetric' or 'twos_complement'")
 
     @property
     def qmax(self) -> int:
         return 2 ** (self.bits - 1) - 1
+
+    @property
+    def qmin(self) -> int:
+        return -self.qmax if self.int_range == "symmetric" else -(2 ** (self.bits - 1))
+
+    def with_rounding(self, rounding: str) -> "StateQuantSpec":
+        """Same quantizer with another rounding rule (used for the RTN Q0)."""
+        if rounding == self.rounding:
+            return self
+        return StateQuantSpec(bits=self.bits, window=self.window, rounding=rounding, seed=self.seed,
+                              scale_axis=self.scale_axis, q0=self.q0, layers=self.layers,
+                              static_scales_dir=self.static_scales_dir, q0_rounding=self.q0_rounding,
+                              int_range=self.int_range)
 
     def applies_to_layer(self, layer_index: int) -> bool:
         return self.layers is None or layer_index in self.layers
@@ -123,6 +147,8 @@ class StateQuantSpec:
             q0=bool(getattr(mamba_config, "state_quant_q0", True)),
             layers=None if layers is None else frozenset(int(x) for x in layers),
             static_scales_dir=getattr(mamba_config, "state_quant_static_scales_dir", None),
+            q0_rounding=str(getattr(mamba_config, "state_quant_q0_rounding", "rtn")),
+            int_range=str(getattr(mamba_config, "state_quant_int_range", "symmetric")),
         )
 
 
@@ -188,17 +214,50 @@ def scale_numel_per_head(shape_ab: tuple[int, int], axis: str) -> int:
     return {"head": 1, "dim1": a, "dim2": b, "rowcol": a + b}[axis]
 
 
+def sr_uniform_noise(shape: tuple[int, ...], seed: int, keys: torch.Tensor,
+                     device: torch.device | str) -> torch.Tensor:
+    """Counter-based uniform noise in [0, 1) for stochastic rounding.
+
+    ``shape`` is ``[rows, heads, *dims]`` and ``keys`` an int64 tensor of
+    shape ``[rows]`` (one key per row, e.g. ``layer * 2**32 + decode_update_index``).
+    Each element's draw is a 32-bit integer hash of ``(seed, key, flat element
+    index)``, so the noise is reproducible, independent of batch composition
+    and of any RNG state, and safe under CUDA-graph capture (pure integer
+    tensor arithmetic; no ``torch.Generator``).
+    """
+    rows = shape[0]
+    per_row = 1
+    for s in shape[1:]:
+        per_row *= int(s)
+    idx = torch.arange(per_row, device=device, dtype=torch.int64).view(1, -1)
+    key = keys.to(device=device, dtype=torch.int64).view(-1, 1)
+    mask32 = (1 << 32) - 1
+    h = (idx * 0x9E3779B1 + (key & mask32) * 0x85EBCA77 + (seed & mask32) * 0xC2B2AE3D) & mask32
+    # murmur3-style finalizer on 32-bit lanes
+    h = (h ^ (h >> 16)) & mask32
+    h = (h * 0x85EBCA6B) & mask32
+    h = (h ^ (h >> 13)) & mask32
+    h = (h * 0xC2B2AE35) & mask32
+    h = (h ^ (h >> 16)) & mask32
+    u = h.to(torch.float32) * (1.0 / 4294967296.0)
+    return u.view(rows, *shape[1:])
+
+
 def quantize_codes(
     x: torch.Tensor,
     spec: StateQuantSpec,
     generator: torch.Generator | None = None,
     scale: torch.Tensor | None = None,
+    sr_keys: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(codes, scale)``; codes are int8 in ``[-qmax, qmax]``.
+    """Return ``(codes, scale)``; codes are int8 in ``[qmin, qmax]``.
 
     ``x`` must be ``[rows, heads, *state_dims]`` (``[rows, heads, A, B]`` for
     axis scaling).  All arithmetic is FP32; ``scale`` follows ``spec.scale_axis``
-    unless given explicitly (fixed-grid experiments).
+    unless given explicitly (fixed-grid experiments).  Stochastic rounding uses
+    counter-based noise keyed by ``sr_keys`` (one int64 per row) and
+    ``spec.seed``; a ``torch.Generator`` is accepted only as an offline
+    fallback when no keys are given.
     """
     if x.dim() < 3:
         raise ValueError("expected [rows, heads, *state_dims]")
@@ -209,11 +268,14 @@ def quantize_codes(
     if spec.rounding == "rtn":
         r = torch.round(y)  # half-to-even, matching the protocol
     else:
-        if generator is None:
-            raise ValueError("stochastic rounding requires an explicit torch.Generator")
-        u = torch.rand(y.shape, generator=generator, device=y.device, dtype=torch.float32)
+        if sr_keys is not None:
+            u = sr_uniform_noise(tuple(y.shape), spec.seed, sr_keys, y.device)
+        elif generator is not None:
+            u = torch.rand(y.shape, generator=generator, device=y.device, dtype=torch.float32)
+        else:
+            raise ValueError("stochastic rounding needs sr_keys (in-situ) or a torch.Generator (offline)")
         r = torch.floor(y + u)
-    r = torch.clamp(r, -float(spec.qmax), float(spec.qmax))
+    r = torch.clamp(r, float(spec.qmin), float(spec.qmax))
     return r.to(torch.int8), scale
 
 
@@ -226,9 +288,10 @@ def quantize_dequantize(
     spec: StateQuantSpec,
     generator: torch.Generator | None = None,
     scale: torch.Tensor | None = None,
+    sr_keys: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fake-quantize ``x`` (``[rows, heads, *dims]``); returns ``x.dtype``."""
-    codes, scale = quantize_codes(x, spec, generator, scale)
+    codes, scale = quantize_codes(x, spec, generator, scale, sr_keys)
     return dequantize_codes(codes, scale).to(x.dtype)
 
 
@@ -292,7 +355,10 @@ def compute_state_hook_schedule_cpu(
     prefill_end = None
     if num_prefills > 0:
         start = num_reqs - num_prefills
-        prefill_end = (t_after[start:num_reqs] >= 0).to(torch.int8)
+        # Exactly the prompt end.  A prefill row with t_after > 0 is a
+        # recomputation after preemption (prompt + generated tokens replayed as
+        # one prefill); its stored state is exact and must not receive a new Q0.
+        prefill_end = (t_after[start:num_reqs] == 0).to(torch.int8)
     return t_d, prefill_end
 
 
@@ -317,10 +383,7 @@ class StateQuantizer:
     def __init__(self, spec: StateQuantSpec, device: torch.device | str,
                  layer_index: int | None = None) -> None:
         self.spec = spec
-        self._generator: torch.Generator | None = None
-        if spec.rounding == "sr":
-            self._generator = torch.Generator(device=device)
-            self._generator.manual_seed(spec.seed)
+        self.layer_index = -1 if layer_index is None else int(layer_index)
         self.static_scale: torch.Tensor | None = None
         if spec.scale_axis == "static":
             if layer_index is None or spec.static_scales_dir is None:
@@ -335,16 +398,32 @@ class StateQuantizer:
         state: torch.Tensor,
         rows: torch.Tensor,
         mask: torch.Tensor | None,
+        q0_mask: torch.Tensor | None = None,
+        update_index: torch.Tensor | None = None,
     ) -> None:
         """In place: ``state[rows[i]] <- deq(q(state[rows[i]]))`` where ``mask[i]``.
 
         ``state`` is ``[slots, heads, *dims]``; ``rows`` is a 1-D slot index
         tensor.  Rows with ``mask == False`` are written back unchanged, so the
-        operation is free of host synchronisation (CUDA-graph friendly for RTN).
+        operation is free of host synchronisation and CUDA-graph safe (the SR
+        noise is counter-based, keyed by layer and decode-update index, so it
+        does not depend on batch composition or RNG state).  Rows flagged in
+        ``q0_mask`` (the prefill-end checkpoint) are encoded with
+        ``spec.q0_rounding`` (RTN by default) instead of ``spec.rounding``.
         """
         rows = rows.reshape(-1).to(torch.long)  # cache indices arrive as int32
         sel = state.index_select(0, rows)
-        deq = quantize_dequantize(sel, self.spec, self._generator, scale=self.static_scale)
+        sr_keys = None
+        if self.spec.rounding == "sr":
+            t = (update_index.reshape(-1)[: rows.numel()].to(torch.int64)
+                 if update_index is not None else torch.zeros(rows.numel(), dtype=torch.int64, device=state.device))
+            sr_keys = (self.layer_index & 0xFFFF) * (1 << 32) + torch.clamp(t, min=0)
+        deq = quantize_dequantize(sel, self.spec, None, scale=self.static_scale, sr_keys=sr_keys)
+        if q0_mask is not None and self.spec.q0_rounding != self.spec.rounding:
+            deq_q0 = quantize_dequantize(sel, self.spec.with_rounding(self.spec.q0_rounding),
+                                         None, scale=self.static_scale)
+            view0 = q0_mask.to(torch.bool).reshape(-1, *([1] * (sel.dim() - 1)))
+            deq = torch.where(view0, deq_q0, deq)
         if mask is not None:
             view = mask.to(torch.bool).reshape(-1, *([1] * (sel.dim() - 1)))
             deq = torch.where(view, deq, sel)
@@ -644,7 +723,8 @@ class LayerStateHook:
             self._trace_prefill_end(state, rows, prefill_end_mask)
         q = self._ensure_quantizer(state.device)
         if q is not None and self.spec is not None and self.spec.q0:
-            q.apply_rows(state, rows, prefill_end_mask)
+            all_q0 = torch.ones(rows.reshape(-1).numel(), dtype=torch.bool, device=state.device)
+            q.apply_rows(state, rows, prefill_end_mask, q0_mask=all_q0)
 
     def _trace_prefill_end(self, state, rows, prefill_end_mask) -> None:
         assert self.tracer is not None
@@ -707,20 +787,33 @@ class LayerStateHook:
                                               state_dtype=str(state.dtype),
                                               state_shape_per_slot=list(state.shape[1:]),
                                               replay_state_snapshots_only_at_flush=True)
-            snapshot_t = self._trace_decode(state, rows, update_index, factors,
-                                            materialized)
+            # A one-token final prefill chunk is scheduled as a decode row and
+            # reaches this hook with t == 0: treat it as the prefill-end
+            # lifecycle (new request, t = 0 snapshot) instead of a decode step.
+            if int(update_index[0].item()) == 0:
+                self._trace_prefill_end(state, rows, None)
+            else:
+                snapshot_t = self._trace_decode(state, rows, update_index, factors,
+                                                materialized)
         q = self._ensure_quantizer(state.device)
         if q is not None and self.spec is not None:
             mask = flush_mask_from_update_index(update_index, self.spec)
-            if kernel_flush_mask is not None and self.tracer is not None:
+            q0_mask = update_index == 0
+            if kernel_flush_mask is not None:
+                # ReplaySSM materializes the checkpoint only at its own flush
+                # rows (which re-anchor after preemption/resume), so the kernel
+                # mask is the source of truth for what can be quantized.  The
+                # t % W schedule is checked against it; a disagreement means
+                # the run's conditions changed (e.g. a preempted request).
                 kmask = kernel_flush_mask.reshape(-1)[:n].to(torch.bool)
-                if not bool(torch.equal(kmask, mask)):
+                if self.tracer is not None and not bool(torch.equal(kmask, mask)):
                     raise RuntimeError(
                         "ReplaySSM flush schedule disagrees with state_quant_window "
                         f"schedule: kernel={kmask.tolist()} quant={mask.tolist()} "
                         f"t={update_index.tolist()}"
                     )
-            q.apply_rows(state, rows, mask)
+                mask = kmask | (q0_mask & mask)
+            q.apply_rows(state, rows, mask, q0_mask=q0_mask, update_index=update_index)
             if snapshot_t is not None and bool(mask[0].item()):
                 assert self.tracer is not None
                 self.tracer.record_state(self.layer_index, snapshot_t,
