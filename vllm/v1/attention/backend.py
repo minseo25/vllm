@@ -467,6 +467,11 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    num_prompt_tokens_cpu: torch.Tensor | None = None
+    """(batch_size,) CPU prompt lengths per request.  Set by the GPU model
+    runner; the research recurrent-state quantization/tracing hooks use it to
+    count decode updates relative to prompt end."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges

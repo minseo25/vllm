@@ -8,6 +8,10 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.state_quant import (
+    compute_state_hook_schedule_cpu,
+    state_hooks_enabled,
+)
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -78,6 +82,13 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # Research state-quantization / tracing schedule (None when disabled):
+    # decode-update index t (>= 1, -1 for padded rows) of each non-spec decode
+    # row after this step, and whether each prefill row completes its prompt
+    # in this step (its stored state is then the t = 0 checkpoint).
+    decode_update_index: torch.Tensor | None = None
+    prefill_end: torch.Tensor | None = None
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
@@ -122,6 +133,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.decode_cudagraph_max_bs = min(
                 self.decode_cudagraph_max_bs,
                 self.compilation_config.max_cudagraph_capture_size,
+            )
+
+        self.state_hooks_enabled = state_hooks_enabled(vllm_config.mamba_config)
+        if self.state_hooks_enabled:
+            if self.use_spec_decode:
+                raise NotImplementedError(
+                    "recurrent-state quantization/tracing hooks do not support "
+                    "speculative decoding"
+                )
+            self.decode_update_index_buf: torch.Tensor = torch.full(
+                (self.decode_cudagraph_max_bs,), -1, dtype=torch.int32, device=device
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
@@ -417,6 +439,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # metadata below is indexed by request.
         batch_size = m.num_reqs
 
+        decode_update_index = None
+        prefill_end = None
+        if self.state_hooks_enabled:
+            # Non-spec batches are ordered decodes first, then prefills.
+            t_d_cpu, prefill_end_cpu = compute_state_hook_schedule_cpu(
+                m, num_decodes, num_prefills
+            )
+            if t_d_cpu is not None:
+                decode_update_index = async_tensor_h2d(
+                    t_d_cpu.tolist(), dtype=torch.int32, device=query_start_loc.device
+                )
+            if prefill_end_cpu is not None:
+                prefill_end = async_tensor_h2d(
+                    prefill_end_cpu.tolist(), dtype=torch.int8, device=query_start_loc.device
+                )
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
@@ -484,6 +522,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
+            if self.state_hooks_enabled and decode_update_index is not None:
+                self.decode_update_index_buf[:num_decodes].copy_(
+                    decode_update_index[:num_decodes], non_blocking=True
+                )
+                decode_update_index = self.decode_update_index_buf[:batch_size]
+                decode_update_index[num_decodes:].fill_(-1)
+
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -509,6 +554,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            decode_update_index=decode_update_index,
+            prefill_end=prefill_end,
         )
         return attn_metadata
 

@@ -39,6 +39,10 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
+from vllm.model_executor.layers.mamba.state_quant import (
+    LayerStateHook,
+    layer_index_from_prefix,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction,
@@ -510,6 +514,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
             else None
         )
         self.mamba_config = vllm_config.mamba_config
+        # Research hook: emulated low-bit checkpoint quantization / tracing of
+        # the recurrent state (see state_quant.py).  No-op unless configured.
+        self.state_hook = LayerStateHook(
+            self.mamba_config, layer_index_from_prefix(prefix), "mamba2"
+        )
+        if self.state_hook.spec is not None and self.use_replayssm:
+            assert self.replayssm_buffer_len is not None
+            if self.replayssm_buffer_len != self.state_hook.spec.window:
+                raise ValueError(
+                    "With --use-replayssm the emulated checkpoint quantizer must "
+                    "use state_quant_window == replayssm_buffer_len "
+                    f"(got {self.state_hook.spec.window} vs {self.replayssm_buffer_len})"
+                )
         if self.use_replayssm and self.num_heads % self.tp_size != 0:
             raise ValueError(
                 "--use-replayssm requires tensor-parallel heads to divide evenly"
@@ -754,6 +771,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
         has_decode = num_decodes > 0
         num_actual_tokens = num_prefill_tokens + num_decode_tokens
 
+        if self.state_hook.enabled and (is_mamba_cache_all or self.num_spec > 0):
+            raise NotImplementedError(
+                "recurrent-state quantization/tracing hooks require "
+                "mamba_cache_mode != 'all' and no speculative decoding"
+            )
+
         # Split along token dimension
         hidden_states_B_C_d, hidden_states_B_C_p = torch.split(
             hidden_states_B_C[:num_actual_tokens],
@@ -976,6 +999,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 #   tensor
                 assert state_indices_tensor_p is not None
                 ssm_state[state_indices_tensor_p] = varlen_states
+                if self.state_hook.enabled:
+                    # t = 0 checkpoint: trace (pre-quant) and optionally Q0.
+                    self.state_hook.on_prefill_end(
+                        ssm_state, state_indices_tensor_p, attn_metadata.prefill_end_p
+                    )
 
         # Process decode requests
         if has_decode:
@@ -1100,6 +1128,37 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     num_accepted_tokens=num_accepted_tokens,
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
+                )
+
+            if self.state_hook.enabled:
+                # Update -> readout (done by the kernel above) -> quantize/store.
+                factors = None
+                if self.state_hook.tracer is not None:
+                    self.state_hook.record_constants(
+                        {"A": self.A, "dt_bias": self.dt_bias, "D": self.D},
+                        family="mamba2",
+                        state_layout="[heads, head_dim(P), state_size(N)]",
+                        readout="out = sum_n state[p,n]*C[n] + x[p]*D[p]; no gate",
+                        dt_convention="dt_softplus(dt + dt_bias) in fp32, no clamp",
+                        n_groups=self.n_groups // self.tp_size,
+                        replay=bool(self.use_replayssm),
+                        replay_buffer_len=self.replayssm_buffer_len,
+                    )
+                    factors = {
+                        "x": hidden_states_d,
+                        "dt": dt_d[..., 0],
+                        "B": B_d,
+                        "C": C_d,
+                        "out": preallocated_ssm_out_d,
+                    }
+                self.state_hook.on_decode_step(
+                    ssm_state,
+                    state_indices_tensor_d_output,
+                    attn_metadata.decode_update_index_d,
+                    factors,
+                    kernel_flush_mask=(
+                        attn_metadata.is_flush_d if self.use_replayssm else None
+                    ),
                 )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:

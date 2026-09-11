@@ -8,6 +8,10 @@ from typing import Any, ClassVar, TypeVar
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.state_quant import (
+    compute_state_hook_schedule_cpu,
+    state_hooks_enabled,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -81,6 +85,13 @@ class BaseMambaAttentionMetadata:
     is_flush_d: torch.Tensor | None = None
     bc_pre_scratch: torch.Tensor | None = None
 
+    # Research state-quantization / tracing schedule (None when disabled):
+    # decode-update index t (>= 1, -1 for padded rows) of each decode row
+    # after this step, and whether each prefill row completes its prompt in
+    # this step (its stored state is then the t = 0 checkpoint).
+    decode_update_index_d: torch.Tensor | None = None
+    prefill_end_p: torch.Tensor | None = None
+
 
 class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
     kv_cache_spec: MambaSpec
@@ -114,6 +125,12 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             self.decode_cudagraph_max_bs = min(
                 self.decode_cudagraph_max_bs,
                 self.compilation_config.max_cudagraph_capture_size,
+            )
+
+        self.state_hooks_enabled = state_hooks_enabled(vllm_config.mamba_config)
+        if self.state_hooks_enabled:
+            self.decode_update_index_d_buf: torch.Tensor = torch.full(
+                (self.decode_cudagraph_max_bs,), -1, dtype=torch.int32, device=device
             )
 
         if self.vllm_config.cache_config.mamba_cache_mode == "all":
@@ -645,6 +662,22 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         ):
             bc_pre_scratch = self.decode_bc_pre_scratch[:num_decodes]
 
+        decode_update_index_d = None
+        prefill_end_p = None
+        if self.state_hooks_enabled:
+            t_d_cpu, prefill_end_cpu = compute_state_hook_schedule_cpu(
+                common_attn_metadata, num_decodes, num_prefills
+            )
+            device = common_attn_metadata.query_start_loc.device
+            if t_d_cpu is not None:
+                decode_update_index_d = async_tensor_h2d(
+                    t_d_cpu.tolist(), dtype=torch.int32, device=device
+                )
+            if prefill_end_cpu is not None:
+                prefill_end_p = async_tensor_h2d(
+                    prefill_end_cpu.tolist(), dtype=torch.int8, device=device
+                )
+
         metadata = self.metadata_cls(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -657,6 +690,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             write_pos_d=write_pos_d,
             is_flush_d=is_flush_d,
             bc_pre_scratch=bc_pre_scratch,
+            decode_update_index_d=decode_update_index_d,
+            prefill_end_p=prefill_end_p,
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc_d=query_start_loc_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
@@ -694,6 +729,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         write_pos_d = metadata.write_pos_d
         is_flush_d = metadata.is_flush_d
         bc_pre_scratch = metadata.bc_pre_scratch
+        decode_update_index_d = metadata.decode_update_index_d
         if (
             metadata.num_prefills == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
@@ -775,8 +811,17 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 if self.decode_bc_pre_scratch is not None:
                     bc_pre_scratch = self.decode_bc_pre_scratch[:padded_bs]
 
+            if self.state_hooks_enabled and decode_update_index_d is not None:
+                self.decode_update_index_d_buf[: metadata.num_decodes].copy_(
+                    decode_update_index_d[: metadata.num_decodes],
+                    non_blocking=True,
+                )
+                decode_update_index_d = self.decode_update_index_d_buf[:padded_bs]
+                decode_update_index_d[metadata.num_decodes :] = -1
+
         return replace(
             metadata,
+            decode_update_index_d=decode_update_index_d,
             state_indices_tensor_d=state_indices_tensor_d,
             query_start_loc_d=query_start_loc_d,
             num_accepted_tokens=num_accepted_tokens,

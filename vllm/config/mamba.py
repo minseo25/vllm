@@ -55,6 +55,39 @@ class MambaConfig:
     be supported by FlashInfer for the active GPU, state dtype, and decoding
     mode."""
 
+    # ---- Research: emulated low-bit checkpoint quantization of the recurrent
+    # state (Mamba2 / Gated DeltaNet).  See
+    # vllm/model_executor/layers/mamba/state_quant.py.  Disabled unless
+    # ``state_quant_bits`` is set.  This is fake quantization: the state stays
+    # in its configured dtype and is replaced by dequant(quant(state)) at flush
+    # steps; no packed storage, no speed claim.
+    state_quant_bits: int | None = None
+    """Integer bit width (4 or 8) of the emulated checkpoint quantizer; None
+    disables the hook."""
+    state_quant_window: int = 1
+    """Flush window W: a request's checkpoint is (re)quantized after decode
+    updates t = W, 2W, ... counted from prompt end.  With --use-replayssm this
+    must equal --replayssm-buffer-len."""
+    state_quant_rounding: Literal["rtn", "sr"] = "rtn"
+    """Rounding: round-to-nearest ties-to-even, or stochastic rounding drawn
+    from a dedicated generator seeded by ``state_quant_seed``."""
+    state_quant_seed: int = 0
+    """Seed of the stochastic-rounding generator (independent of sampling)."""
+    state_quant_q0: bool = True
+    """Also quantize the prefill-end checkpoint (t = 0) once."""
+    state_quant_layers: list[int] | None = None
+    """Restrict the hook to these model layer indices; None means every
+    recurrent layer."""
+    state_trace_dir: str | None = None
+    """If set, dump per-step native recurrence factors, kernel readouts and
+    state snapshots of each request to this directory (requires eager mode
+    and max_num_seqs=1).  Works with or without quantization."""
+    state_trace_snapshot_every: int = 256
+    """Store a full state snapshot every this many decode updates (plus a
+    fixed set of early anchors)."""
+    state_trace_max_steps: int = 8192
+    """Stop recording per-step factors after this many decode updates."""
+
     @field_validator("backend", mode="before")
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:
@@ -80,8 +113,19 @@ class MambaConfig:
                 "or omit `--mamba-ssu-algorithm`."
             )
 
+    def validate_state_quant(self) -> None:
+        if self.state_quant_bits is not None and self.state_quant_bits not in (4, 8):
+            raise ValueError("state_quant_bits must be 4 or 8 (or None to disable)")
+        if self.state_quant_window < 1:
+            raise ValueError("state_quant_window must be >= 1")
+        if self.state_quant_rounding not in ("rtn", "sr"):
+            raise ValueError("state_quant_rounding must be 'rtn' or 'sr'")
+        if self.state_trace_snapshot_every < 0 or self.state_trace_max_steps < 0:
+            raise ValueError("state_trace_* values must be non-negative")
+
     def __post_init__(self):
         self.validate_ssu_algorithm()
+        self.validate_state_quant()
         if self.enable_stochastic_rounding:
             from vllm.platforms import current_platform
 

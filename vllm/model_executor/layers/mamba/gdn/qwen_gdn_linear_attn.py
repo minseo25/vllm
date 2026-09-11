@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
+from vllm.model_executor.layers.mamba.state_quant import LayerStateHook
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
@@ -480,6 +481,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+        )
+        # Research hook: emulated low-bit checkpoint quantization / tracing of
+        # the recurrent state (see ../state_quant.py).  No-op unless configured.
+        self.state_hook = LayerStateHook(
+            get_current_vllm_config().mamba_config, self.layer_idx, "gdn"
         )
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -1417,6 +1423,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_indices=non_spec_state_indices_tensor,
                 use_qk_l2norm_in_kernel=True,
             )
+            if self.state_hook.enabled:
+                self._state_hook_decode(
+                    ssm_state,
+                    non_spec_state_indices_tensor[: attn_metadata.num_decodes],
+                    attn_metadata,
+                    q=query_decode,
+                    k=key_decode,
+                    v=value_decode,
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    out=core_attn_out_decode,
+                    path="fused_sigmoid_gating",
+                )
         else:
             core_attn_out_decode = None
 
@@ -1450,6 +1469,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if self.state_hook.enabled:
+                # t = 0 checkpoint: trace (pre-quant) and optionally Q0.
+                self.state_hook.on_prefill_end(
+                    ssm_state, prefill_state_indices, attn_metadata.prefill_end
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1477,6 +1501,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     use_qk_l2norm_in_kernel=True,
                 )
             )
+            if self.state_hook.enabled:
+                self._state_hook_decode(
+                    ssm_state,
+                    non_spec_state_indices_tensor[: attn_metadata.num_decodes],
+                    attn_metadata,
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    a=a,
+                    b=b,
+                    out=core_attn_out_non_spec,
+                    path="fused_sigmoid_gating",
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -1613,7 +1650,71 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
+        if self.state_hook.enabled:
+            q = k = v = None
+            if self.state_hook.tracer is not None:
+                q, k, v = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+            self._state_hook_decode(
+                ssm_state,
+                non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                attn_metadata,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                out=out_buf,
+                path="packed_decode",
+            )
         return
+
+    def _state_hook_decode(
+        self,
+        ssm_state: torch.Tensor,
+        rows: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        *,
+        q: torch.Tensor | None,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        out: torch.Tensor | None,
+        path: str,
+    ) -> None:
+        """Update -> readout (kernel) -> emulated quantize/store, plus tracing.
+
+        Traced factors are the kernel's own inputs: post-conv raw ``q``/``k``
+        (before in-kernel L2 normalisation and scaling), raw ``v``, raw gating
+        pre-activations ``a`` (``g = -exp(A_log) * softplus(a + dt_bias)``) and
+        ``b`` (``beta = sigmoid(b)``), and the kernel output ``out``
+        (``sum_k state[v,k] * q_norm[k] * K**-0.5``, before norm/gate).
+        """
+        factors = None
+        if self.state_hook.tracer is not None:
+            self.state_hook.record_constants(
+                {"A_log": self.A_log, "dt_bias": self.dt_bias},
+                family="gdn",
+                state_layout="[value_heads(HV), head_v_dim(V), head_k_dim(K)]",
+                readout="out[v] = sum_k state[v,k] * (l2norm(q)[k] * K**-0.5); no norm/gate",
+                decode_path=path,
+                num_k_heads=self.num_k_heads // self.tp_size,
+                num_v_heads=self.num_v_heads // self.tp_size,
+                l2norm_eps=1e-6,
+                softplus_threshold=20.0,
+            )
+            factors = {"a": a, "b": b}
+            if q is not None:
+                factors["q"] = q.reshape(-1, *q.shape[-2:])
+            if k is not None:
+                factors["k"] = k.reshape(-1, *k.shape[-2:])
+            if v is not None:
+                factors["v"] = v.reshape(-1, *v.shape[-2:])
+            if out is not None:
+                factors["out"] = out.reshape(-1, *out.shape[-2:])
+        self.state_hook.on_decode_step(
+            ssm_state, rows, attn_metadata.decode_update_index, factors
+        )
 
 
 def qwen_gdn_attention_core(
