@@ -358,6 +358,8 @@ class StateTracer:
         self._write_manifest()
 
     def _write_manifest(self) -> None:
+        # The runner may already have removed a sentinel request's directory.
+        os.makedirs(self._request_dir(), exist_ok=True)
         path = os.path.join(self._request_dir(), "trace_manifest.json")
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -576,8 +578,11 @@ class LayerStateHook:
         this token's readout.  ``update_index[i]`` is the decode-update index
         ``t >= 1`` of row ``i`` after this step (``< 0`` for padded rows).
 
-        ``kernel_flush_mask`` (ReplaySSM ``is_flush_d``) lets trace runs verify
-        that the kernel's own flush schedule coincides with ``t % W == 0``.
+        ``kernel_flush_mask`` (ReplaySSM ``is_flush_d``) marks the rows whose
+        persistent state the kernel actually materialized this step.  With
+        ReplaySSM the non-flush rows still hold the previous checkpoint, so
+        state snapshots are only recorded at flush steps and trace runs verify
+        that the kernel's schedule coincides with ``t % W == 0``.
         """
         if update_index is None:
             raise RuntimeError("state quantization/tracing needs decode_update_index metadata")
@@ -588,7 +593,15 @@ class LayerStateHook:
         update_index = update_index[:n]
         snapshot_t = None
         if self.tracer is not None and factors is not None:
-            snapshot_t = self._trace_decode(state, rows, update_index, factors)
+            materialized = True
+            if kernel_flush_mask is not None:
+                materialized = bool(kernel_flush_mask.reshape(-1)[0].item())
+                self.tracer.record_layer_meta(self.layer_index, family=self.family,
+                                              state_dtype=str(state.dtype),
+                                              state_shape_per_slot=list(state.shape[1:]),
+                                              replay_state_snapshots_only_at_flush=True)
+            snapshot_t = self._trace_decode(state, rows, update_index, factors,
+                                            materialized)
         q = self._ensure_quantizer(state.device)
         if q is not None and self.spec is not None:
             mask = flush_mask_from_update_index(update_index, self.spec)
@@ -606,7 +619,8 @@ class LayerStateHook:
                 self.tracer.record_state(self.layer_index, snapshot_t,
                                          state[rows[0]], suffix="_post")
 
-    def _trace_decode(self, state, rows, update_index, factors) -> int | None:
+    def _trace_decode(self, state, rows, update_index, factors,
+                      materialized: bool = True) -> int | None:
         assert self.tracer is not None
         if rows.numel() != 1:
             raise RuntimeError("state tracing requires max_num_seqs=1 (one decode row)")
@@ -616,7 +630,7 @@ class LayerStateHook:
         self.tracer.record_step(self.layer_index, t,
                                 {k: v[0] if v.dim() > 0 and v.shape[0] == 1 else v
                                  for k, v in factors.items()})
-        if self.tracer.should_snapshot(t):
+        if materialized and self.tracer.should_snapshot(t):
             # Pre-quantization state after this update (the readout was produced
             # from exactly this state).
             self.tracer.record_state(self.layer_index, t, state[rows[0]])
