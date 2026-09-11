@@ -73,6 +73,17 @@ class MambaConfig:
     from a dedicated generator seeded by ``state_quant_seed``."""
     state_quant_seed: int = 0
     """Seed of the stochastic-rounding generator (independent of sampling)."""
+    state_quant_scale_axis: Literal["head", "dim1", "dim2", "rowcol", "static"] = "head"
+    """Scale grouping over one slot's state [heads, A, B]: 'head' = one absmax
+    scale per head (naive); 'dim1' = one per (head, a) over B (Mamba2: per
+    head_dim channel; GDN: per value dim); 'dim2' = one per (head, b) over A
+    (Mamba2: per state index; GDN: per key dim); 'rowcol' = two-axis r_a*c_b
+    (our variant); 'static' = calibrated per-layer scale tables loaded from
+    ``state_quant_static_scales_dir`` (Quamba2-style cached-state scales).
+    Dynamic axes recompute the scale at every encoding."""
+    state_quant_static_scales_dir: str | None = None
+    """Directory with ``layer{L:02d}.safetensors`` (key ``scale``, FP32 step
+    sizes broadcastable to [heads, A, B]) for ``state_quant_scale_axis='static'``."""
     state_quant_q0: bool = True
     """Also quantize the prefill-end checkpoint (t = 0) once."""
     state_quant_layers: list[int] | None = None
@@ -128,6 +139,10 @@ class MambaConfig:
             raise ValueError("state_quant_window must be >= 1")
         if self.state_quant_rounding not in ("rtn", "sr"):
             raise ValueError("state_quant_rounding must be 'rtn' or 'sr'")
+        if self.state_quant_scale_axis not in ("head", "dim1", "dim2", "rowcol", "static"):
+            raise ValueError("state_quant_scale_axis must be head, dim1, dim2, rowcol or static")
+        if self.state_quant_scale_axis == "static" and not self.state_quant_static_scales_dir:
+            raise ValueError("state_quant_scale_axis='static' requires state_quant_static_scales_dir")
         if self.state_trace_snapshot_every < 0 or self.state_trace_max_steps < 0:
             raise ValueError("state_trace_* values must be non-negative")
 

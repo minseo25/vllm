@@ -48,6 +48,19 @@ logger = init_logger(__name__)
 
 _VALID_BITS = (4, 8)
 _VALID_ROUNDING = ("rtn", "sr")
+# Scale grouping over one slot's state ``[heads, A, B]`` (physical layout):
+#   head   one FP32 absmax scale per head (the protocol's naive quantizer)
+#   dim1   one scale per (head, a): absmax over the last axis B
+#          (Mamba2 [H,P,N]: per head_dim channel; GDN [HV,V,K]: per value dim)
+#   dim2   one scale per (head, b): absmax over axis A
+#          (Mamba2: per state index n; GDN: per key dim k)
+#   rowcol two-axis scale r_a * c_b (row absmax, then column absmax of the
+#          row-normalised matrix); our variant, not a published recipe
+#   static calibrated (offline) scale table per layer, loaded from
+#          ``state_quant_static_scales_dir/layer{L:02d}.safetensors`` (key
+#          "scale", shape broadcastable to [heads, A, B]); this is how
+#          Quamba2 stores its 8-bit cached SSM states (static grouped scales)
+_VALID_SCALE_AXES = ("head", "dim1", "dim2", "rowcol", "static")
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,7 @@ class StateQuantSpec:
     scale_axis: str = "head"
     q0: bool = True
     layers: frozenset[int] | None = None
+    static_scales_dir: str | None = None  # required when scale_axis == "static"
 
     def __post_init__(self) -> None:
         if self.bits not in _VALID_BITS:
@@ -69,8 +83,10 @@ class StateQuantSpec:
             raise ValueError("state_quant_window must be >= 1")
         if self.rounding not in _VALID_ROUNDING:
             raise ValueError(f"state_quant_rounding must be one of {_VALID_ROUNDING}")
-        if self.scale_axis != "head":
-            raise ValueError("only per-head absmax scaling is implemented")
+        if self.scale_axis not in _VALID_SCALE_AXES:
+            raise ValueError(f"state_quant_scale_axis must be one of {_VALID_SCALE_AXES}")
+        if self.scale_axis == "static" and not self.static_scales_dir:
+            raise ValueError("scale_axis='static' needs state_quant_static_scales_dir")
 
     @property
     def qmax(self) -> int:
@@ -95,8 +111,10 @@ class StateQuantSpec:
             window=int(getattr(mamba_config, "state_quant_window", 1)),
             rounding=str(getattr(mamba_config, "state_quant_rounding", "rtn")),
             seed=int(getattr(mamba_config, "state_quant_seed", 0)),
+            scale_axis=str(getattr(mamba_config, "state_quant_scale_axis", "head")),
             q0=bool(getattr(mamba_config, "state_quant_q0", True)),
             layers=None if layers is None else frozenset(int(x) for x in layers),
+            static_scales_dir=getattr(mamba_config, "state_quant_static_scales_dir", None),
         )
 
 
@@ -113,6 +131,55 @@ def per_head_absmax_scale(x: torch.Tensor, qmax: int) -> torch.Tensor:
     return scale.reshape(x.shape[0], x.shape[1], *([1] * (x.dim() - 2)))
 
 
+def _nonzero(scale: torch.Tensor) -> torch.Tensor:
+    return torch.where(scale > 0, scale, torch.ones_like(scale))
+
+
+def absmax_scale(x: torch.Tensor, qmax: int, axis: str) -> torch.Tensor:
+    """Dynamic absmax scale for ``x`` = ``[rows, heads, A, B]`` under ``axis``.
+
+    Returns an FP32 tensor broadcastable to ``x`` such that ``|x / scale| <= qmax``
+    (up to FP32 rounding, which the caller clamps).  Zero groups get scale 1.
+    """
+    if axis == "head":
+        return per_head_absmax_scale(x, qmax)
+    if x.dim() != 4:
+        raise ValueError("axis scaling needs [rows, heads, A, B] states")
+    xf = x.detach().abs().to(torch.float32)
+    if axis == "dim1":
+        return _nonzero(xf.amax(dim=-1, keepdim=True) / float(qmax))
+    if axis == "dim2":
+        return _nonzero(xf.amax(dim=-2, keepdim=True) / float(qmax))
+    if axis == "rowcol":
+        r = _nonzero(xf.amax(dim=-1, keepdim=True))            # [rows, heads, A, 1]
+        c = _nonzero((xf / r).amax(dim=-2, keepdim=True))      # [rows, heads, 1, B], <= 1
+        return r * c / float(qmax)
+    if axis == "static":
+        raise ValueError("static scales must be passed explicitly (loaded per layer)")
+    raise ValueError(f"unknown scale axis {axis!r}")
+
+
+def load_static_scales(directory: str, layer_index: int, device: torch.device | str) -> torch.Tensor:
+    """Load a calibrated per-layer scale table ``[heads, A, B]`` (broadcastable).
+
+    File: ``<directory>/layer{L:02d}.safetensors`` with key ``scale`` (FP32).
+    Values already include the ``/ qmax`` division (i.e. they are step sizes).
+    """
+    from safetensors.torch import load_file
+
+    path = os.path.join(directory, f"layer{layer_index:02d}.safetensors")
+    table = load_file(path)["scale"].to(torch.float32)
+    if table.dim() != 3:
+        raise ValueError(f"{path}: expected a 3-D [heads, A, B]-broadcastable scale, got {tuple(table.shape)}")
+    return _nonzero(table).to(device)
+
+
+def scale_numel_per_head(shape_ab: tuple[int, int], axis: str) -> int:
+    """Number of scale values stored per head for a state of shape ``[A, B]``."""
+    a, b = shape_ab
+    return {"head": 1, "dim1": a, "dim2": b, "rowcol": a + b}[axis]
+
+
 def quantize_codes(
     x: torch.Tensor,
     spec: StateQuantSpec,
@@ -121,13 +188,15 @@ def quantize_codes(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(codes, scale)``; codes are int8 in ``[-qmax, qmax]``.
 
-    ``x`` must be ``[rows, heads, *state_dims]``.  All arithmetic is FP32.
+    ``x`` must be ``[rows, heads, *state_dims]`` (``[rows, heads, A, B]`` for
+    axis scaling).  All arithmetic is FP32; ``scale`` follows ``spec.scale_axis``
+    unless given explicitly (fixed-grid experiments).
     """
     if x.dim() < 3:
         raise ValueError("expected [rows, heads, *state_dims]")
     xf = x.detach().to(torch.float32)
     if scale is None:
-        scale = per_head_absmax_scale(xf, spec.qmax)
+        scale = absmax_scale(xf, spec.qmax, spec.scale_axis)
     y = xf / scale
     if spec.rounding == "rtn":
         r = torch.round(y)  # half-to-even, matching the protocol
@@ -237,13 +306,21 @@ def flush_mask_from_update_index(
 class StateQuantizer:
     """Applies the emulated quantizer to selected rows of a state tensor."""
 
-    def __init__(self, spec: StateQuantSpec, device: torch.device | str) -> None:
+    def __init__(self, spec: StateQuantSpec, device: torch.device | str,
+                 layer_index: int | None = None) -> None:
         self.spec = spec
         self._generator: torch.Generator | None = None
         if spec.rounding == "sr":
             self._generator = torch.Generator(device=device)
             self._generator.manual_seed(spec.seed)
+        self.static_scale: torch.Tensor | None = None
+        if spec.scale_axis == "static":
+            if layer_index is None or spec.static_scales_dir is None:
+                raise ValueError("static scales need the layer index and a scales directory")
+            # [heads, A, B] -> [1, heads, A, B] to broadcast over rows
+            self.static_scale = load_static_scales(spec.static_scales_dir, layer_index, device).unsqueeze(0)
         self.num_flushes = 0
+        self.num_clipped = 0
 
     def apply_rows(
         self,
@@ -259,7 +336,7 @@ class StateQuantizer:
         """
         rows = rows.reshape(-1).to(torch.long)  # cache indices arrive as int32
         sel = state.index_select(0, rows)
-        deq = quantize_dequantize(sel, self.spec, self._generator)
+        deq = quantize_dequantize(sel, self.spec, self._generator, scale=self.static_scale)
         if mask is not None:
             view = mask.to(torch.bool).reshape(-1, *([1] * (sel.dim() - 1)))
             deq = torch.where(view, deq, sel)
@@ -543,7 +620,7 @@ class LayerStateHook:
         if self.spec is None:
             return None
         if self.quantizer is None:
-            self.quantizer = StateQuantizer(self.spec, device)
+            self.quantizer = StateQuantizer(self.spec, device, layer_index=self.layer_index)
         return self.quantizer
 
     # -- prefill end (t = 0) ---------------------------------------------- #
