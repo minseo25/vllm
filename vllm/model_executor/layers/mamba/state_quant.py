@@ -28,6 +28,14 @@ Scope (EffHybridAttn SSM state quantization study, 2026-09):
 The optional tracer dumps per-step native factors, kernel readouts and state
 snapshots for a single request at a time so that frozen-factor analyses can
 be run offline.  Tracing forces eager execution and batch size one.
+
+Precision context (vLLM 0.27): the state tensor this hook rewrites has the
+dtype selected by ``mamba_ssm_cache_dtype``; "auto" (the default) resolves to
+the model dtype (BF16).  The EffHybridAttn study always runs with
+``mamba_ssm_cache_dtype=float32`` (FP32 state, BF16 weights), the same setting
+the ReplaySSM authors report; the ReplaySSM ring stores x/B in BF16 and dt in
+FP32.  The hook itself is dtype-agnostic: it quantizes FP32 copies of the
+selected rows and writes back in the state dtype.
 """
 
 from __future__ import annotations
