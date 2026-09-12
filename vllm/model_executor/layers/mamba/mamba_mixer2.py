@@ -519,6 +519,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.state_hook = LayerStateHook(
             self.mamba_config, layer_index_from_prefix(prefix), "mamba2"
         )
+        if self.state_hook.enabled and cache_config.mamba_cache_mode == "align":
+            raise ValueError(
+                "state_quant/state_trace hooks assume mamba_cache_mode='none': "
+                "'align' forces block-boundary flushes off the t % W schedule"
+            )
         if self.state_hook.spec is not None and self.use_replayssm:
             assert self.replayssm_buffer_len is not None
             if self.replayssm_buffer_len != self.state_hook.spec.window:

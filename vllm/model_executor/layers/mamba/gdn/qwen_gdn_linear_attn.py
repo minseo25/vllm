@@ -504,6 +504,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.replayssm_buffer_len = (
             self.cache_config.replayssm_buffer_len if self.use_replayssm else None
         )
+        if self.state_hook.enabled and self.cache_config.mamba_cache_mode == "align":
+            raise ValueError(
+                "state_quant/state_trace hooks assume mamba_cache_mode='none': "
+                "'align' forces block-boundary flushes off the t % W schedule"
+            )
         if self.use_replayssm and self.state_hook.spec is not None:
             # Emulated checkpoint quantization under ReplaySSM quantizes exactly
             # the rows the kernel flushes (is_flush_d); keep both schedules equal.

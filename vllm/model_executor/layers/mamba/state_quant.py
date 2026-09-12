@@ -805,14 +805,25 @@ class LayerStateHook:
                 # mask is the source of truth for what can be quantized.  The
                 # t % W schedule is checked against it; a disagreement means
                 # the run's conditions changed (e.g. a preempted request).
+                if kernel_flush_mask.numel() < n:
+                    raise RuntimeError(
+                        f"kernel flush mask has {kernel_flush_mask.numel()} rows, hook has {n}"
+                    )
                 kmask = kernel_flush_mask.reshape(-1)[:n].to(torch.bool)
-                if self.tracer is not None and not bool(torch.equal(kmask, mask)):
+                # A t == 0 row (one-token final prefill chunk run as a decode
+                # row) is a *forced* kernel flush that only materializes the
+                # prefill-end checkpoint; whether it is quantized is the Q0
+                # decision, not the window schedule.  Compare and follow the
+                # kernel mask on decode rows (t > 0) only.
+                decode_rows = update_index > 0
+                if self.tracer is not None and not bool(
+                        torch.equal(kmask & decode_rows, mask & decode_rows)):
                     raise RuntimeError(
                         "ReplaySSM flush schedule disagrees with state_quant_window "
                         f"schedule: kernel={kmask.tolist()} quant={mask.tolist()} "
                         f"t={update_index.tolist()}"
                     )
-                mask = kmask | (q0_mask & mask)
+                mask = (kmask & decode_rows) | (q0_mask & mask)
             q.apply_rows(state, rows, mask, q0_mask=q0_mask, update_index=update_index)
             if snapshot_t is not None and bool(mask[0].item()):
                 assert self.tracer is not None
