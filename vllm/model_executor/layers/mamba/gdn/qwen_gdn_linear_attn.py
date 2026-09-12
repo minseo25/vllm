@@ -1881,6 +1881,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state_layout="[value_heads(HV), head_v_dim(V), head_k_dim(K)]",
                 readout="out[v] = sum_k state[v,k] * (l2norm(q)[k] * K**-0.5); no norm/gate",
                 decode_path=path,
+                replay=self.use_replayssm,
+                replay_buffer_len=self.replayssm_buffer_len,
+                replay_ring_dtypes=(
+                    {"d": "float16", "k": "float16", "g": "float32"}
+                    if self.use_replayssm and b.dtype == torch.bfloat16 else None
+                ),
                 num_k_heads=self.num_k_heads // self.tp_size,
                 num_v_heads=self.num_v_heads // self.tp_size,
                 l2norm_eps=1e-6,

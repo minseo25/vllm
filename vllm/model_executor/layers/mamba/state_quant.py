@@ -232,14 +232,18 @@ def sr_uniform_noise(shape: tuple[int, ...], seed: int, keys: torch.Tensor,
     idx = torch.arange(per_row, device=device, dtype=torch.int64).view(1, -1)
     key = keys.to(device=device, dtype=torch.int64).view(-1, 1)
     mask32 = (1 << 32) - 1
-    h = (idx * 0x9E3779B1 + (key & mask32) * 0x85EBCA77 + (seed & mask32) * 0xC2B2AE3D) & mask32
+    seed_hash = ((seed & mask32) * 0xC2B2AE3D) & mask32
+    h = (idx * 0x9E3779B1 + (key & mask32) * 0x85EBCA77
+         + ((key >> 32) & mask32) * 0x27D4EB2F + seed_hash) & mask32
     # murmur3-style finalizer on 32-bit lanes
     h = (h ^ (h >> 16)) & mask32
     h = (h * 0x85EBCA6B) & mask32
     h = (h ^ (h >> 13)) & mask32
     h = (h * 0xC2B2AE35) & mask32
     h = (h ^ (h >> 16)) & mask32
-    u = h.to(torch.float32) * (1.0 / 4294967296.0)
+    # Use the representable 24-bit fraction: converting a full uint32 to
+    # float32 can round its maximum to 2**32, incorrectly producing 1.0.
+    u = (h >> 8).to(torch.float32) * (1.0 / 16777216.0)
     return u.view(rows, *shape[1:])
 
 
@@ -557,8 +561,9 @@ class StateTracer:
 
     def record_layer_meta(self, layer: int, **meta: Any) -> None:
         if layer not in self._layer_meta:
-            self._layer_meta[layer] = dict(meta)
+            self._layer_meta[layer] = {}
             self._manifest["layers"][str(layer)] = self._layer_meta[layer]
+        self._layer_meta[layer].update(meta)
 
     def record_constants(self, layer: int, tensors: dict[str, torch.Tensor],
                          **meta: Any) -> None:
@@ -780,21 +785,28 @@ class LayerStateHook:
         update_index = update_index[:n]
         snapshot_t = None
         if self.tracer is not None and factors is not None:
+            if n != 1:
+                raise RuntimeError("state tracing requires max_num_seqs=1 (one decode row)")
+            trace_t = int(update_index[0].item())
             materialized = True
             if kernel_flush_mask is not None:
                 materialized = bool(kernel_flush_mask.reshape(-1)[0].item())
+            # A one-token final prefill chunk is scheduled as a decode row and
+            # reaches this hook with t == 0: treat it as the prefill-end
+            # lifecycle (new request, t = 0 snapshot) instead of a decode step.
+            if trace_t == 0:
+                self._trace_prefill_end(state, rows, None)
+            elif trace_t > 0:
+                snapshot_t = self._trace_decode(state, rows, update_index, factors,
+                                                materialized)
+            # A first/final one-token prefill may enter through decode. The
+            # request must exist before adding its metadata; unfinished prompt
+            # chunks and padded rows must not create or mutate a request.
+            if trace_t >= 0 and kernel_flush_mask is not None:
                 self.tracer.record_layer_meta(self.layer_index, family=self.family,
                                               state_dtype=str(state.dtype),
                                               state_shape_per_slot=list(state.shape[1:]),
                                               replay_state_snapshots_only_at_flush=True)
-            # A one-token final prefill chunk is scheduled as a decode row and
-            # reaches this hook with t == 0: treat it as the prefill-end
-            # lifecycle (new request, t = 0 snapshot) instead of a decode step.
-            if int(update_index[0].item()) == 0:
-                self._trace_prefill_end(state, rows, None)
-            else:
-                snapshot_t = self._trace_decode(state, rows, update_index, factors,
-                                                materialized)
         q = self._ensure_quantizer(state.device)
         if q is not None and self.spec is not None:
             mask = flush_mask_from_update_index(update_index, self.spec)
