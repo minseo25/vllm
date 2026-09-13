@@ -152,8 +152,11 @@ class MambaConfig:
                 raise ValueError("method codecs require INT4 RTN dim1 symmetric")
             if self.state_quant_method in ("head_budget", "head_budget_control", "residual4") and not self.state_quant_method_data_dir:
                 raise ValueError("method codec requires frozen method_data_dir")
-        if self.state_quant_bits is not None and self.state_quant_bits not in (4, 8):
-            raise ValueError("state_quant_bits must be 4 or 8 (or None to disable)")
+        if (
+            self.state_quant_bits is not None
+            and self.state_quant_bits not in (4, 6, 8)
+        ):
+            raise ValueError("state_quant_bits must be 4, 6 or 8 (or None to disable)")
         if self.state_quant_window < 1:
             raise ValueError("state_quant_window must be >= 1")
         if self.state_quant_rounding not in ("rtn", "sr"):

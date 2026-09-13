@@ -54,7 +54,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_VALID_BITS = (4, 8)
+_VALID_BITS = (4, 6, 8)
 _VALID_ROUNDING = ("rtn", "sr")
 # Scale grouping over one slot's state ``[heads, A, B]`` (physical layout):
 #   head   one FP32 absmax scale per head (the protocol's naive quantizer)
