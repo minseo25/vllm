@@ -97,12 +97,17 @@ class StateQuantSpec:
         from .state_quant_methods import METHODS
         if self.method not in METHODS:
             raise ValueError("unknown state quantization method")
+        expected_axis = "rowcol" if self.method == "residual4_rowcol" else "dim1"
         if self.method != "native" and (self.bits != 4 or self.rounding != "rtn"
-                                        or self.scale_axis != "dim1"
+                                        or self.scale_axis != expected_axis
                                         or self.q0_rounding != "rtn"
                                         or self.int_range != "symmetric"):
-            raise ValueError("method search requires INT4 RTN dim1 symmetric configuration")
-        if self.method in ("head_budget", "head_budget_control", "residual4") and not self.method_data_dir:
+            raise ValueError(
+                f"method search requires INT4 RTN {expected_axis} symmetric configuration"
+            )
+        if self.method in (
+            "head_budget", "head_budget_control", "residual4", "residual4_rowcol"
+        ) and not self.method_data_dir:
             raise ValueError("calibrated method requires state_quant_method_data_dir")
         if self.bits not in _VALID_BITS:
             raise ValueError(f"state_quant_bits must be one of {_VALID_BITS}")
@@ -413,10 +418,12 @@ class StateQuantizer:
         self.layer_index = -1 if layer_index is None else int(layer_index)
         self.static_scale: torch.Tensor | None = None
         self.method_table: torch.Tensor | None = None
-        if spec.method in ("head_budget", "head_budget_control", "residual4"):
+        if spec.method in (
+            "head_budget", "head_budget_control", "residual4", "residual4_rowcol"
+        ):
             from safetensors.torch import load_file
             key = {"head_budget": "high_bits", "head_budget_control": "control_high_bits",
-                   "residual4": "basis"}[spec.method]
+                   "residual4": "basis", "residual4_rowcol": "basis"}[spec.method]
             path = os.path.join(spec.method_data_dir, f"layer{self.layer_index:02d}.safetensors")
             self.method_table = load_file(path, device="cpu")[key].to(device)
         if spec.scale_axis == "static":

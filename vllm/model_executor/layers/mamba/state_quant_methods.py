@@ -13,6 +13,7 @@ import torch
 METHODS = (
     "native", "block32", "block16", "key_hadamard",
     "key_hadamard_identity", "head_budget", "head_budget_control", "residual4",
+    "residual4_rowcol",
 )
 
 
@@ -74,10 +75,17 @@ def encode_decode(x: torch.Tensor, method: str,
             raise ValueError("head budget requires one frozen bit selector per head")
         qmax = torch.where(table, 127.0, 7.0).reshape(1, -1, 1, 1)
         return rtn(xf, qmax).to(x.dtype)
-    if method == "residual4":
+    if method in ("residual4", "residual4_rowcol"):
         if table is None or table.shape != (xf.shape[1], xf.shape[-1], 4):
             raise ValueError("residual4 needs a frozen [head, key, 4] basis")
-        base = rtn(xf)
+        if method == "residual4_rowcol":
+            from .state_quant import StateQuantSpec, quantize_dequantize
+
+            base = quantize_dequantize(
+                xf, StateQuantSpec(bits=4, window=8, scale_axis="rowcol")
+            )
+        else:
+            base = rtn(xf)
         coefficients = torch.matmul(xf - base, table).to(torch.bfloat16)
         correction = torch.matmul(coefficients.to(torch.float32), table.transpose(-1, -2))
         return (base + correction).to(x.dtype)
