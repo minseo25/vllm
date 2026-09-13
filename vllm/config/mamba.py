@@ -89,7 +89,7 @@ class MambaConfig:
     and SR window conditions share the same initial checkpoint."""
     state_quant_method: Literal["native", "block32", "block16", "key_hadamard",
                                 "key_hadamard_identity", "head_budget",
-                                "head_budget_control", "residual4"] = "native"
+                                "head_budget_control", "residual4", "row_outlier1"] = "native"
     """Research method codec; all implementations reconstruct dense fake-quant state."""
     state_quant_method_data_dir: str | None = None
     """Frozen calibration tables for residual/head-budget method codecs."""

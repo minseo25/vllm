@@ -13,6 +13,7 @@ import torch
 METHODS = (
     "native", "block32", "block16", "key_hadamard",
     "key_hadamard_identity", "head_budget", "head_budget_control", "residual4",
+    "row_outlier1",
 )
 
 
@@ -58,6 +59,14 @@ def encode_decode(x: torch.Tensor, method: str,
     if x.ndim != 4:
         raise ValueError("method codecs require [slot, head, value, key]")
     xf = x.to(torch.float32)
+    if method == "row_outlier1":
+        if xf.shape[-1] != 128 or table is not None:
+            raise ValueError("row_outlier1 requires K128 and no calibration table")
+        # Argmax selects the first index on ties. The exception stays FP32.
+        index = xf.abs().argmax(dim=-1, keepdim=True)
+        exception = xf.gather(-1, index)
+        remainder = xf.scatter(-1, index, 0.0)
+        return rtn(remainder).scatter(-1, index, exception).to(x.dtype)
     if method in ("block32", "block16"):
         group = 32 if method == "block32" else 16
         if xf.shape[-1] % group:
