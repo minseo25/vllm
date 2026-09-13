@@ -90,8 +90,20 @@ class StateQuantSpec:
     # Integer range: "symmetric" = [-qmax, qmax] (the study's naive codec);
     # "twos_complement" = [-2^(b-1), 2^(b-1)-1] as in Quamba2's Python codec.
     int_range: str = "symmetric"
+    method: str = "native"
+    method_data_dir: str | None = None
 
     def __post_init__(self) -> None:
+        from .state_quant_methods import METHODS
+        if self.method not in METHODS:
+            raise ValueError("unknown state quantization method")
+        if self.method != "native" and (self.bits != 4 or self.rounding != "rtn"
+                                        or self.scale_axis != "dim1"
+                                        or self.q0_rounding != "rtn"
+                                        or self.int_range != "symmetric"):
+            raise ValueError("method search requires INT4 RTN dim1 symmetric configuration")
+        if self.method in ("head_budget", "head_budget_control", "residual4") and not self.method_data_dir:
+            raise ValueError("calibrated method requires state_quant_method_data_dir")
         if self.bits not in _VALID_BITS:
             raise ValueError(f"state_quant_bits must be one of {_VALID_BITS}")
         if self.window < 1:
@@ -122,7 +134,8 @@ class StateQuantSpec:
         return StateQuantSpec(bits=self.bits, window=self.window, rounding=rounding, seed=self.seed,
                               scale_axis=self.scale_axis, q0=self.q0, layers=self.layers,
                               static_scales_dir=self.static_scales_dir, q0_rounding=self.q0_rounding,
-                              int_range=self.int_range)
+                              int_range=self.int_range, method=self.method,
+                              method_data_dir=self.method_data_dir)
 
     def applies_to_layer(self, layer_index: int) -> bool:
         return self.layers is None or layer_index in self.layers
@@ -149,6 +162,8 @@ class StateQuantSpec:
             static_scales_dir=getattr(mamba_config, "state_quant_static_scales_dir", None),
             q0_rounding=str(getattr(mamba_config, "state_quant_q0_rounding", "rtn")),
             int_range=str(getattr(mamba_config, "state_quant_int_range", "symmetric")),
+            method=str(getattr(mamba_config, "state_quant_method", "native")),
+            method_data_dir=getattr(mamba_config, "state_quant_method_data_dir", None),
         )
 
 
@@ -263,6 +278,8 @@ def quantize_codes(
     ``spec.seed``; a ``torch.Generator`` is accepted only as an offline
     fallback when no keys are given.
     """
+    if spec.method != "native":
+        raise ValueError("method codecs expose reconstruction, not native codes/scales")
     if x.dim() < 3:
         raise ValueError("expected [rows, heads, *state_dims]")
     xf = x.detach().to(torch.float32)
@@ -293,8 +310,14 @@ def quantize_dequantize(
     generator: torch.Generator | None = None,
     scale: torch.Tensor | None = None,
     sr_keys: torch.Tensor | None = None,
+    method_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fake-quantize ``x`` (``[rows, heads, *dims]``); returns ``x.dtype``."""
+    if spec.method != "native":
+        if scale is not None:
+            raise ValueError("method codecs do not accept an external scale")
+        from .state_quant_methods import encode_decode
+        return encode_decode(x, spec.method, method_table)
     codes, scale = quantize_codes(x, spec, generator, scale, sr_keys)
     return dequantize_codes(codes, scale).to(x.dtype)
 
@@ -389,6 +412,13 @@ class StateQuantizer:
         self.spec = spec
         self.layer_index = -1 if layer_index is None else int(layer_index)
         self.static_scale: torch.Tensor | None = None
+        self.method_table: torch.Tensor | None = None
+        if spec.method in ("head_budget", "head_budget_control", "residual4"):
+            from safetensors.torch import load_file
+            key = {"head_budget": "high_bits", "head_budget_control": "control_high_bits",
+                   "residual4": "basis"}[spec.method]
+            path = os.path.join(spec.method_data_dir, f"layer{self.layer_index:02d}.safetensors")
+            self.method_table = load_file(path, device="cpu")[key].to(device)
         if spec.scale_axis == "static":
             if layer_index is None or spec.static_scales_dir is None:
                 raise ValueError("static scales need the layer index and a scales directory")
@@ -422,10 +452,11 @@ class StateQuantizer:
             t = (update_index.reshape(-1)[: rows.numel()].to(torch.int64)
                  if update_index is not None else torch.zeros(rows.numel(), dtype=torch.int64, device=state.device))
             sr_keys = (self.layer_index & 0xFFFF) * (1 << 32) + torch.clamp(t, min=0)
-        deq = quantize_dequantize(sel, self.spec, None, scale=self.static_scale, sr_keys=sr_keys)
+        deq = quantize_dequantize(sel, self.spec, None, scale=self.static_scale, sr_keys=sr_keys,
+                                 method_table=self.method_table)
         if q0_mask is not None and self.spec.q0_rounding != self.spec.rounding:
             deq_q0 = quantize_dequantize(sel, self.spec.with_rounding(self.spec.q0_rounding),
-                                         None, scale=self.static_scale)
+                                         None, scale=self.static_scale, method_table=self.method_table)
             view0 = q0_mask.to(torch.bool).reshape(-1, *([1] * (sel.dim() - 1)))
             deq = torch.where(view0, deq_q0, deq)
         if mask is not None:

@@ -85,8 +85,14 @@ class MambaConfig:
     """Directory with ``layer{L:02d}.safetensors`` (key ``scale``, FP32 step
     sizes broadcastable to [heads, A, B]) for ``state_quant_scale_axis='static'``."""
     state_quant_q0_rounding: Literal["rtn", "sr"] = "rtn"
-    """Rounding of the prefill-end checkpoint (Q0).  Kept RTN by default so RTN
+    """Rounding of the prefill-end checkpoint (Q0). Kept RTN by default so RTN
     and SR window conditions share the same initial checkpoint."""
+    state_quant_method: Literal["native", "block32", "block16", "key_hadamard",
+                                "key_hadamard_identity", "head_budget",
+                                "head_budget_control", "residual4"] = "native"
+    """Research method codec; all implementations reconstruct dense fake-quant state."""
+    state_quant_method_data_dir: str | None = None
+    """Frozen calibration tables for residual/head-budget method codecs."""
     state_quant_int_range: Literal["symmetric", "twos_complement"] = "symmetric"
     """Integer code range: symmetric [-qmax, qmax] (study default) or
     two's-complement [-2^(b-1), 2^(b-1)-1] (Quamba2's Python codec)."""
@@ -139,6 +145,13 @@ class MambaConfig:
             )
 
     def validate_state_quant(self) -> None:
+        if self.state_quant_method != "native":
+            if (self.state_quant_bits != 4 or self.state_quant_rounding != "rtn"
+                    or self.state_quant_scale_axis != "dim1"
+                    or self.state_quant_int_range != "symmetric"):
+                raise ValueError("method codecs require INT4 RTN dim1 symmetric")
+            if self.state_quant_method in ("head_budget", "head_budget_control", "residual4") and not self.state_quant_method_data_dir:
+                raise ValueError("method codec requires frozen method_data_dir")
         if self.state_quant_bits is not None and self.state_quant_bits not in (4, 8):
             raise ValueError("state_quant_bits must be 4 or 8 (or None to disable)")
         if self.state_quant_window < 1:
