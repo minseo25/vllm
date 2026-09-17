@@ -455,13 +455,12 @@ class EngineCore:
         if (
             self.async_scheduling is not False
             or self.batch_queue is not None
-            or scheduler.max_num_running_reqs != 1
             or scheduler.vllm_config.cache_config.enable_prefix_caching
             or scheduler.connector is not None
             or scheduler.ec_connector is not None
         ):
             raise RuntimeError(
-                "Compaction requires synchronous B1 without cache sharing"
+                "Compaction requires synchronous execution without cache sharing"
             )
         pool = scheduler.kv_cache_manager.block_pool
         common = {

@@ -1202,6 +1202,8 @@ class GPUModelRunner(
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
+        if self.compaction is not None:
+            self.compaction.finish_requests(scheduler_output.finished_req_ids)
         for req_id in scheduler_output.finished_req_ids:
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
@@ -3967,6 +3969,21 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Mamba2 keeps first-token rows on the prefill path and does not refresh
+        # the persistent decode state indices for them. They cannot replay a
+        # FULL decode graph. Capture supplies force_uniform_decode explicitly.
+        has_fresh_mamba_prefill = (
+            force_uniform_decode is None
+            and np.any(
+                (self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0)
+                & (num_scheduled_tokens_np == 1)
+            )
+            and any(
+                isinstance(group.get_metadata_builder(), Mamba2AttentionMetadataBuilder)
+                for group in self._attn_group_iterator()
+            )
+        )
+
         # Compute LoRA state for cudagraph dispatch
         num_active_loras = (
             force_num_active_loras
@@ -3984,7 +4001,9 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes={CUDAGraphMode.FULL}
+                if disable_full or has_fresh_mamba_prefill
+                else None,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4452,7 +4471,13 @@ class GPUModelRunner(
         ):
             compaction = self.compaction
             boundary = (
-                compaction.before_forward(attn_metadata, positions)
+                compaction.before_forward(
+                    attn_metadata,
+                    positions,
+                    scheduler_output.num_scheduled_tokens,
+                    cudagraph_mode.name,
+                    num_reqs_padded,
+                )
                 if compaction is not None
                 else None
             )
@@ -5701,34 +5726,50 @@ class GPUModelRunner(
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            # Bound vocabulary projection independently of transformer prefill.
+            # Match V2's 1024-row prompt-logprob chunks, but retain the V1
+            # sampler and CPU accumulation (including full-vocabulary output).
+            # Tunable at runtime (cc_set_prompt_logprob_rows) so a validation run
+            # can compare chunked against single-projection scoring on real GEMMs.
+            max_logits_per_chunk = int(getattr(self, "prompt_logprobs_chunk_rows", 1024))
+            for chunk_start in range(0, num_logits, max_logits_per_chunk):
+                chunk_end = min(chunk_start + max_logits_per_chunk, num_logits)
+                prompt_hidden_states = hidden_states[
+                    offset + chunk_start : offset + chunk_end
+                ]
+                logits = self.model.compute_logits(prompt_hidden_states)
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+                # Hidden state i predicts prompt token i+1.
+                tgt_token_ids = prompt_token_ids[
+                    start_tok + chunk_start : start_tok + chunk_end
+                ]
 
-            # Compute prompt scores respecting logprobs_mode.
-            # NOTE: prompt tokens skip sampling processors, so
-            # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
-            else:
-                scores = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
-            )
+                # Prompt tokens skip processors, so raw_* and processed_*
+                # modes have the same scores here.
+                if self.model_config.logprobs_mode in (
+                    "raw_logits",
+                    "processed_logits",
+                ):
+                    scores = logits.to(torch.float32)
+                else:
+                    scores = self.sampler.compute_logprobs(logits)
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    scores, num_prompt_logprobs, tgt_token_ids
+                )
 
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+                # Transfer each result directly into its final CPU slice.
+                chunk_slice = slice(start_idx + chunk_start, start_idx + chunk_end)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[chunk_slice].copy_(
+                    logprobs, non_blocking=True
+                )
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    ranks, non_blocking=True
+                )
+                # Release the large scores before the next projection allocates.
+                del logits, scores, token_ids, logprobs, ranks
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.

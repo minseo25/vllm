@@ -1197,6 +1197,13 @@ class Worker(WorkerBase):
         expected_prompt_tokens: int | None = None,
         start_cursor: int = 0,
         expected_request_id: str | None = None,
+        restore_at: int = 0,
+        restore_components: str = "all",
+        kv_restore_name: str | None = None,
+        position_offset: int = 0,
+        capture_kv: dict | None = None,
+        audit_restore: bool = False,
+        prefill_boundary: int | None = None,
     ) -> dict:
         """Arm one subsequent request for native-state capture and/or restore."""
         return self._cc_controller().arm(
@@ -1205,15 +1212,89 @@ class Worker(WorkerBase):
             expected_prompt_tokens,
             start_cursor,
             expected_request_id,
+            restore_at,
+            restore_components,
+            kv_restore_name,
+            position_offset,
+            capture_kv,
+            audit_restore,
+            prefill_boundary,
         )
 
     def cc_result(self) -> dict:
         """Return the last request receipt and disarm its compaction operation."""
         return self._cc_controller().result()
 
+    def cc_set_prompt_logprob_rows(self, rows: int) -> dict:
+        """Set the prompt-logprob projection chunk (rows of hidden states per GEMM).
+
+        Validation only: a large value reproduces the historical single
+        projection so chunked scoring can be compared on the same prompt.
+        """
+        from vllm.v1.worker.compaction import CompactionContractError
+
+        if type(rows) is not int or rows < 1:
+            raise CompactionContractError("rows must be a positive integer")
+        self._cc_controller()
+        previous = int(getattr(self.model_runner, "prompt_logprobs_chunk_rows", 1024))
+        self.model_runner.prompt_logprobs_chunk_rows = rows
+        return {"previous_rows": previous, "rows": rows}
+
     def cc_snapshots(self) -> dict:
-        """Return metadata for the worker's immutable CPU state snapshots."""
+        """Return cached metadata, without copying or rehashing snapshot tensors."""
         return self._cc_controller().snapshots()
+
+    def cc_results(self, operation_ids: list[str]) -> dict:
+        """Close and return completed operations submitted through extra_args."""
+        return self._cc_controller().results(operation_ids)
+
+    def cc_audit(self, names: list[str] | None = None) -> dict:
+        """Explicitly verify CPU snapshots and any GPU staging copies."""
+        return self._cc_controller().audit(names)
+
+    def cc_stage(self, names: list[str]) -> dict:
+        """Stage snapshots once on this worker's device for repeated restores."""
+        return self._cc_controller().stage(names)
+
+    def cc_unstage(self, names: list[str]) -> dict:
+        """Release GPU staging copies while retaining the CPU snapshots."""
+        return self._cc_controller().unstage(names)
+
+    def cc_kv_snapshots(self) -> dict:
+        """Return metadata for exact selected-KV snapshots."""
+        return self._cc_controller().kv_store.list()
+
+    def cc_kv_stage(self, names: list[str]) -> dict:
+        """Stage selected-KV snapshots once on this worker's device."""
+        controller = self._cc_controller()
+        return {
+            name: controller.kv_store.stage(name, controller.runner.device)
+            for name in names
+        }
+
+    def cc_kv_audit(
+        self, names: str | list[str] | None = None, *, name: str | None = None
+    ) -> dict:
+        """Explicitly verify selected-KV snapshots and their staging copies."""
+        store = self._cc_controller().kv_store
+        if name is not None:
+            if names is not None:
+                raise ValueError("Specify name or names, not both")
+            names = name
+        if isinstance(names, str):
+            return store.audit(names)
+        return {
+            name: store.audit(name)
+            for name in (names if names is not None else store.list()["snapshots"])
+        }
+
+    def cc_kv_drop(self, name: str) -> dict:
+        """Release a selected-KV snapshot unused by active operations."""
+        return self._cc_controller().kv_drop(name)
+
+    def cc_memory_stats(self, reset_peak: bool = False) -> dict:
+        """Report snapshot payloads plus current and peak CUDA allocator bytes."""
+        return self._cc_controller().memory_stats(reset_peak)
 
     def cc_drop(self, name: str) -> dict:
         """Release a snapshot which is not used by an active operation."""

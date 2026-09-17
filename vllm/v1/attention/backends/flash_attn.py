@@ -406,6 +406,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
+        self.uniform_decode_query_len = 1 + vllm_config.num_speculative_tokens
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
         if self.use_full_cuda_graph and self.aot_schedule:
@@ -502,11 +503,16 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.use_full_cuda_graph
             and self.max_cudagraph_size is not None
             and num_actual_tokens <= self.max_cudagraph_size
+            and (
+                not self.compilation_config.cudagraph_mode.separate_routine()
+                or max_query_len <= self.uniform_decode_query_len
+            )
         ):
             # NOTE(woosuk): Setting num_splits > 1 may increase the memory
             # usage, because the intermediate buffers of size [num_splits,
             # num_heads, num_tokens, head_size] are allocated. Therefore,
-            # we only set num_splits when using cuda graphs.
+            # only bound splits for batches that may use full CUDA graphs.
+            # Separate routines run prefill attention outside piecewise graphs.
             max_num_splits = self.max_num_splits
 
         if envs.VLLM_BATCH_INVARIANT:

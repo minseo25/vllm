@@ -12,6 +12,9 @@ import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    CompilationConfig,
+    CompilationMode,
+    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -37,6 +40,7 @@ from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -1133,6 +1137,117 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
     assert len(kv_cache_config_after_init.kv_cache_groups[0].layer_names) == 2
     assert kv_cache_config_after_init.kv_cache_groups[0].layer_names[0] == layer_0
     assert kv_cache_config_after_init.kv_cache_groups[0].layer_names[1] == layer_1
+
+
+@pytest.mark.cpu_test
+class TestMambaFreshTokenCudagraph:
+    """Fresh Mamba prefills must not consume captured decode-slot indices."""
+
+    @staticmethod
+    def runner(mode, cursors, backend="mamba2"):
+        compilation = CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=mode,
+            cudagraph_capture_sizes=[1, 4, 32],
+            max_cudagraph_capture_size=32,
+        )
+        parallel = ParallelConfig()
+        compilation.set_splitting_ops_for_v1(
+            all2all_backend=parallel.all2all_backend,
+            data_parallel_size=parallel.data_parallel_size,
+        )
+        compilation.post_init_cudagraph_sizes()
+        config = SimpleNamespace(
+            compilation_config=compilation,
+            parallel_config=parallel,
+            scheduler_config=SchedulerConfig.default_factory(max_num_seqs=32),
+            num_speculative_tokens=0,
+            lora_config=None,
+            observability_config=SimpleNamespace(cudagraph_metrics=False),
+        )
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(compilation.cudagraph_mode)
+        builder_cls = {
+            "mamba2": gpu_model_runner_module.Mamba2AttentionMetadataBuilder,
+            "gdn": gpu_model_runner_module.GDNAttentionMetadataBuilder,
+        }.get(backend)
+        groups = []
+        if builder_cls is not None:
+            builder = object.__new__(builder_cls)
+            groups = [SimpleNamespace(get_metadata_builder=lambda: builder)]
+        return SimpleNamespace(
+            _is_uniform_decode=GPUModelRunner._is_uniform_decode,
+            uniform_decode_query_len=1,
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            # Trailing zero slots are inactive, including in a padded graph.
+            input_batch=SimpleNamespace(
+                num_computed_tokens_cpu=np.array([*cursors, 0, 0]),
+                lora_id_to_lora_request={},
+            ),
+            _attn_group_iterator=lambda: iter(groups),
+            _pad_for_sequence_parallelism=lambda n: n,
+            compilation_config=compilation,
+            parallel_config=parallel,
+            vllm_config=config,
+            cudagraph_dispatcher=dispatcher,
+        )
+
+    @staticmethod
+    def dispatch(runner, queries, force=None):
+        return GPUModelRunner._determine_batch_execution_and_padding(
+            runner,
+            num_tokens=sum(queries),
+            num_reqs=len(queries),
+            num_scheduled_tokens_np=np.array(queries),
+            max_num_scheduled_tokens=max(queries),
+            use_cascade_attn=False,
+            force_uniform_decode=force,
+        )
+
+    @pytest.mark.parametrize(
+        "mode,backend,cursors,queries,force,expected,padded",
+        [
+            ("FULL_AND_PIECEWISE", "mamba2", [0], [1], None, "PIECEWISE", 1),
+            ("FULL_AND_PIECEWISE", "mamba2", [9, 0, 2], [1] * 3, None, "PIECEWISE", 4),
+            ("FULL_DECODE_ONLY", "mamba2", [0], [1], None, "NONE", 1),
+            ("FULL", "mamba2", [0], [1], None, "NONE", 1),
+            ("FULL_AND_PIECEWISE", "mamba2", [1] * 32, [1] * 32, None, "FULL", 32),
+            ("FULL_AND_PIECEWISE", "mamba2", [1, 9, 2], [1] * 3, None, "FULL", 4),
+            ("FULL_AND_PIECEWISE", "mamba2", [0], [1], True, "FULL", 1),
+            ("FULL_AND_PIECEWISE", "mamba2", [0], [1], False, "PIECEWISE", 1),
+            ("FULL_AND_PIECEWISE", "gdn", [0], [1], None, "FULL", 1),
+            ("FULL_AND_PIECEWISE", "none", [0], [1], None, "FULL", 1),
+            # A fresh multi-token row is outside this narrowly scoped fix.
+            ("FULL", "mamba2", [9, 0], [1, 2], None, "FULL", 4),
+        ],
+    )
+    def test_fresh_prefill_fallback_preserves_decode_and_capture(
+        self, mode, backend, cursors, queries, force, expected, padded
+    ):
+        runner = self.runner(mode, cursors, backend)
+        actual, descriptor, *_ = self.dispatch(runner, queries, force)
+        assert actual == CUDAGraphMode[expected]
+        assert descriptor.num_tokens == padded
+
+    def test_fresh_prefill_exclusion_survives_dp_redispatch(self, monkeypatch):
+        runner = self.runner("FULL_AND_PIECEWISE", [9, 0, 2])
+        runner.parallel_config.data_parallel_size = 2
+        runner.parallel_config.data_parallel_rank = 0
+        dispatcher = runner.cudagraph_dispatcher
+        dispatcher.dispatch = Mock(wraps=dispatcher.dispatch)
+        coordinate = Mock(
+            return_value=(False, torch.tensor([4, 4]), CUDAGraphMode.PIECEWISE.value)
+        )
+        monkeypatch.setattr(
+            gpu_model_runner_module, "coordinate_batch_across_dp", coordinate
+        )
+        actual, descriptor, *_ = self.dispatch(runner, [1, 1, 1])
+        assert actual == CUDAGraphMode.PIECEWISE
+        assert descriptor.num_tokens == 4
+        assert coordinate.call_args.kwargs["cudagraph_mode"] == actual.value
+        assert dispatcher.dispatch.call_count == 2
+        for call in dispatcher.dispatch.call_args_list:
+            assert call.kwargs["invalid_modes"] == {CUDAGraphMode.FULL}
 
 
 @pytest.mark.skipif(

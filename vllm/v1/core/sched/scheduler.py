@@ -38,6 +38,10 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.compaction import (
+    limit_compaction_tokens,
+    refuse_compaction_preemption,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -572,6 +576,10 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            num_new_tokens = limit_compaction_tokens(
+                request, request.num_computed_tokens, num_new_tokens
+            )
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -614,6 +622,7 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
+                    refuse_compaction_preemption(preempted_req)
                     self._preempt_request(
                         preempted_req,
                         scheduled_timestamp,
@@ -943,6 +952,9 @@ class Scheduler(SchedulerInterface):
                         break
 
                 # During async KV load, no forward pass is run yet.
+                num_new_tokens = limit_compaction_tokens(
+                    request, num_computed_tokens, num_new_tokens
+                )
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
                 limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0

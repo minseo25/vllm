@@ -33,6 +33,39 @@ from vllm.v1.structured_output import StructuredOutputManager
 STOP_TOKEN = 128001
 
 
+@pytest.mark.parametrize("budget,counts", [(128, [73, 55]), (32, [32, 32, 9, 32, 23])])
+def test_compaction_boundary_splits_waiting_and_running_schedules(budget, counts):
+    scheduler = create_scheduler()
+    scheduler.max_num_scheduled_tokens = budget
+    request = DummyRequest("graft", resumable=False, prompt_token_ids=list(range(128)))
+    request.sampling_params.extra_args = {
+        "native_compaction_v1": {
+            "operation_id": "graft-op",
+            "expected_prompt_tokens": 128,
+            "restore_at": 73,
+        }
+    }
+    scheduler.add_request(request)
+    cursor = 0
+    for expected in counts:
+        scheduled = scheduler.schedule()
+        assert scheduled.num_scheduled_tokens == {"graft": expected}
+        assert not cursor < 73 < cursor + expected
+        cursor += expected
+        scheduler.update_from_output(
+            scheduled,
+            ModelRunnerOutput(
+                req_ids=["graft"],
+                req_id_to_index={"graft": 0},
+                sampled_token_ids=[[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+    assert cursor == 128
+
+
 class DummyRequest(Request):
     def __init__(
         self,
@@ -205,6 +238,24 @@ def test_native_reader_rejects_active_chunk_and_cumulative_overflow():
     with pytest.raises(ValueError, match="Cumulative"):
         engine.add_compaction_input([4] * 1021, session_id)
     assert engine.compaction_status(session_id) == before
+
+
+def test_native_reader_uses_actual_exclusivity_on_a_batch_capable_engine():
+    """Batched probe capacity must not prohibit an otherwise exclusive reader."""
+    engine, core = create_compaction_engine()
+    core.scheduler.max_num_running_reqs = 32
+    session_id = engine.add_compaction_input([1, 2, 3])
+    complete_compaction_chunk(engine, core)
+    assert engine.compaction_status(session_id)["num_computed_tokens"] == 3
+    core.scheduler.add_request(DummyRequest("other", prompt_token_ids=[4, 5]))
+    free_before = core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    with pytest.raises(RuntimeError, match="completed, unpreempted"):
+        engine.release_compaction_session(session_id)
+    assert core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == (
+        free_before
+    )
+    core.scheduler.finish_requests(["other"], RequestStatus.FINISHED_ABORTED)
+    assert engine.release_compaction_session(session_id)["frontend_removed"]
 
 
 @pytest.mark.parametrize("violation", ["queued", "inflight", "preempted"])

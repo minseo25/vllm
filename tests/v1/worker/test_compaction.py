@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.v1.worker.compaction import (
+    DESCRIPTOR_KEY,
     BoundaryOperation,
     CompactionContractError,
     NativeCompactionController,
@@ -47,7 +48,8 @@ def test_restore_routes_to_current_slot_and_snapshot_survives_probe(family, pref
         state.fill_(99)
     target = slot(family=family, index=2, prefill=prefill, value=-1.0)
     receipt = store.restore("H", [target])
-    assert receipt["snapshot_unchanged_after_restore"]
+    assert receipt["snapshot_unchanged_after_restore"] is None
+    assert store.audit("H")["immutable_digest_verified"]
     for state in target.states:
         assert torch.all(state[2] == 3)
         assert torch.all(state[:2] == -1)
@@ -180,10 +182,8 @@ def config():
         ("cache_config", "mamba_cache_mode", "align"),
         ("scheduler_config", "async_scheduling", True),
         ("scheduler_config", "async_scheduling", None),
-        ("scheduler_config", "max_num_seqs", 2),
         ("mamba_config", "state_quant_bits", 8),
         ("mamba_config", "state_trace_dir", "/tmp/trace"),
-        ("model_config", "enforce_eager", False),
     ],
 )
 def test_unsupported_lifecycle_configuration_fails_closed(section, key, value):
@@ -364,11 +364,18 @@ def controller_fixture():
     controller = object.__new__(NativeCompactionController)
     controller.store = SnapshotStore()
     controller.operation = None
+    controller.operations = {}
+    controller._descriptors = {}
+    controller._retired_bindings = {}
+    controller._seen_operation_ids = set()
+    controller._position_rules = {}
+    controller.layer_groups = {}
     controller.layers = {"layer0": ("gdn", NS(kv_cache=current.states))}
     controller.fa_layers = {"fa"}
     controller.metadata_types = {"gdn": NS}
     controller.runner = NS(
         execute_model_state=None,
+        device=torch.device("cpu"),
         input_batch=NS(
             num_reqs=1,
             req_ids=["request"],
@@ -437,17 +444,28 @@ def test_failed_model_forward_cannot_publish_a_successful_boundary_receipt():
     assert controller.snapshots() == {}
 
 
-def test_fresh_session_without_restore_rejects_a_decode_first_forward():
-    """Recurrent slots are never zeroed on allocation; a fresh decode row would consume stale state."""
+def test_fresh_one_token_decode_zeros_stale_state_before_consuming_first_token():
+    """Fresh budget-limited decode rows must not inherit the retired slot."""
     store = SnapshotStore()
-    op = BoundaryOperation(store, capture_name=None, restore_name=None, expected_prompt_tokens=1)
-    with pytest.raises(CompactionContractError, match="prefill forward"):
-        op.before("r1", 1, 0, 1, [slot(prefill=False)])
-    # a prefill first forward is accepted, and so is a decode row when a snapshot is restored
-    op2 = BoundaryOperation(store, capture_name=None, restore_name=None, expected_prompt_tokens=4)
+    op = BoundaryOperation(
+        store, capture_name=None, restore_name=None, expected_prompt_tokens=1
+    )
+    current = slot(prefill=False, value=99.0)
+    op.before("r1", 1, 0, 1, [current])
+    for state in current.states:
+        assert torch.all(state[current.index] == 0)
+        assert torch.all(state[0] == 99)
+    op.after(1, [current])
+    assert op.result()["fresh_decode_state_zeroed"]
+    # A restored decode row has a defined initial state.
+    op2 = BoundaryOperation(
+        store, capture_name=None, restore_name=None, expected_prompt_tokens=4
+    )
     op2.before("r2", 4, 0, 4, [slot(prefill=True)])
     store.capture("H", [slot(value=2.0)], {"processed_prompt_tokens": 4})
-    op3 = BoundaryOperation(store, capture_name=None, restore_name="H", expected_prompt_tokens=1)
+    op3 = BoundaryOperation(
+        store, capture_name=None, restore_name="H", expected_prompt_tokens=1
+    )
     op3.before("r3", 1, 0, 1, [slot(prefill=False)])
     assert op3.restore_receipt is not None
 
@@ -464,3 +482,522 @@ def test_compare_reports_relative_frobenius_without_mutation():
     assert abs(report["per_layer"]["layer0"][1] - 0.01) < 1e-6
     assert abs(report["max_relative_frobenius"] - 0.01) < 1e-6
     assert store.describe("A")["digest"] == store.describe("A")["digest"]
+
+
+def test_graph_and_batch_configuration_retains_lifecycle_guards():
+    supported = config()
+    supported.scheduler_config.max_num_seqs = 32
+    supported.model_config.enforce_eager = False
+    validate_configuration(supported)
+    supported.parallel_config.use_ubatching = True
+    with pytest.raises(CompactionContractError, match="microbatching"):
+        validate_configuration(supported)
+
+
+@pytest.mark.parametrize("family", ["gdn", "mamba2"])
+@pytest.mark.parametrize("components,selected", [("matrix", 1), ("conv", 0)])
+@pytest.mark.parametrize("fresh", [False, True])
+def test_component_restore_preserves_live_other_component_or_zeros_fresh_slot(
+    family, components, selected, fresh
+):
+    store = SnapshotStore()
+    store.capture("H", [slot(family=family, value=7.0)], {})
+    current = slot(family=family, value=3.0)
+    receipt = store.restore(
+        "H", [current], components, zero_unselected=fresh, audit_restore=True
+    )
+    assert torch.all(current.states[selected][current.index] == 7)
+    assert torch.all(current.states[1 - selected][current.index] == (0 if fresh else 3))
+    assert receipt["copy_audit"]["selected_components_exact"]
+    field = "fresh_unselected_zero" if fresh else "unselected_components_preserved"
+    assert receipt["copy_audit"][field]
+    assert store.audit("H")["immutable_digest_verified"]
+
+
+def test_summary_graft_intervenes_once_at_boundary_before_new_query():
+    store = SnapshotStore()
+    store.capture("H", [slot(value=7.0)], {})
+    current = slot(value=1.0)
+    operation = BoundaryOperation(
+        store,
+        capture_name="end",
+        restore_name="H",
+        expected_prompt_tokens=5,
+        restore_at=3,
+        restore_components="matrix",
+        audit_restore=True,
+    )
+    with pytest.raises(CompactionContractError, match="restore_at"):
+        operation.before("r", 5, 0, 4, [current])
+    assert torch.all(current.states[1] == 1)
+    operation.before("r", 5, 0, 3, [current])
+    current.states[0][current.index].fill_(4)
+    current.states[1][current.index].fill_(5)
+    operation.after(3, [current])
+    operation.before("r", 5, 3, 2, [current])
+    assert torch.all(current.states[0][current.index] == 4)
+    assert torch.all(current.states[1][current.index] == 7)
+    operation.after(2, [current])
+    result = operation.result()
+    assert result["restore"]["at_cursor"] == 3
+    assert result["restore"]["copy_audit"]["unselected_components_preserved"]
+
+
+@pytest.mark.parametrize("boundary", [0, -1, 5, 6, True, 2.0])
+def test_prefill_boundary_must_be_an_exact_interior_token_cursor(boundary):
+    with pytest.raises(CompactionContractError, match="prefill_boundary"):
+        BoundaryOperation(
+            SnapshotStore(),
+            capture_name=None,
+            restore_name=None,
+            expected_prompt_tokens=5,
+            prefill_boundary=boundary,
+        )
+
+
+def test_negative_offset_cannot_defer_failure_until_kv_capture_after_forward():
+    with pytest.raises(CompactionContractError, match="nonnegative"):
+        BoundaryOperation(
+            SnapshotStore(),
+            capture_name=None,
+            restore_name=None,
+            expected_prompt_tokens=5,
+            restore_at=3,
+            position_offset=-1,
+            capture_kv={"name": "invalid", "token_indices": [0]},
+        )
+
+
+def test_prefill_barrier_does_not_move_restore_and_rejects_crossing_before_writes():
+    store = SnapshotStore()
+    store.capture("H", [slot(value=7.0)], {})
+    current = slot(value=-1.0)
+    operation = BoundaryOperation(
+        store,
+        capture_name=None,
+        restore_name="H",
+        expected_prompt_tokens=5,
+        restore_at=0,
+        prefill_boundary=3,
+    )
+    with pytest.raises(CompactionContractError, match="prefill_boundary"):
+        operation.before("r", 5, 0, 4, [current])
+    assert torch.all(current.states[1] == -1)
+    assert operation.request_id is None
+    operation.before("r", 5, 0, 3, [current])
+    assert torch.all(current.states[1][current.index] == 7)
+    current.states[1][current.index].fill_(9)
+    operation.after(3, [current])
+    operation.before("r", 5, 3, 2, [current])
+    assert torch.all(current.states[1][current.index] == 9)
+    operation.after(2, [current])
+    receipt = operation.result()
+    assert receipt["prefill_boundary"] == 3
+    assert receipt["restore"]["at_cursor"] == receipt["restore_at"] == 0
+
+
+def test_metadata_is_cached_and_explicit_audit_detects_corrupt_source(monkeypatch):
+    import vllm.v1.worker.compaction as module
+
+    store = SnapshotStore()
+    store.capture("H", [slot(value=2.0)], {})
+    original_hash = module._tensor_digest
+    calls = []
+
+    def count_hash(layers):
+        calls.append(True)
+        return original_hash(layers)
+
+    monkeypatch.setattr(module, "_tensor_digest", count_hash)
+    store.describe("H")
+    store.list()
+    store.restore("H", [slot()])
+    assert not calls
+    assert not store.describe("H")["immutable_digest_verified"]
+    assert store.audit("H")["immutable_digest_verified"]
+    assert len(calls) == 1
+    store._entries["H"]["layers"]["layer0"][1][1].add_(1)
+    with pytest.raises(CompactionContractError, match="mutated"):
+        store.audit("H")
+
+
+def batch_controller(family, requests, *, num_decodes=0, padding=0):
+    """Requests: (id, cursor, query_count, descriptor, allocated_state_index)."""
+    controller, _, _ = controller_fixture()
+    states = (torch.full((8, 2, 3), -1.0), torch.full((8, 2, 4, 4), -1.0))
+    count = len(requests)
+    indices = torch.tensor([r[4] for r in requests] + [0] * padding)
+    prefills = count - num_decodes
+    metadata = NS(
+        num_prefills=prefills,
+        num_decodes=num_decodes + padding,
+        num_spec_decodes=0,
+        num_prefill_tokens=sum(r[2] for r in requests[num_decodes:]),
+        num_decode_tokens=sum(r[2] for r in requests[:num_decodes]) + padding,
+    )
+    assert padding == 0 or prefills == 0
+    if family == "gdn":
+        metadata.prefill_state_indices = indices[num_decodes:] if prefills else None
+        metadata.non_spec_state_indices_tensor = indices
+        metadata.has_initial_state = (
+            torch.zeros(count, dtype=torch.bool) if prefills else None
+        )
+        metadata.prefill_has_initial_state = (
+            torch.zeros(prefills, dtype=torch.bool) if prefills else None
+        )
+    else:
+        metadata.state_indices_tensor_p = indices[num_decodes:] if prefills else None
+        metadata.state_indices_tensor_d = indices[: num_decodes + padding, None]
+        metadata.has_initial_states_p = (
+            torch.zeros(prefills, dtype=torch.bool) if prefills else None
+        )
+        metadata.prep_initial_states = False
+    controller.layers = {"layer0": (family, NS(kv_cache=states))}
+    controller.metadata_types = {family: NS}
+    batch = controller.runner.input_batch
+    batch.num_reqs = count
+    batch.req_ids = [r[0] for r in requests]
+    batch.num_computed_tokens_cpu = [r[1] for r in requests]
+    controller.runner.requests = {
+        request_id: NS(
+            mm_features=[],
+            prompt_embeds=None,
+            lora_request=None,
+            num_computed_tokens=cursor,
+            num_prompt_tokens=descriptor["expected_prompt_tokens"]
+            if descriptor
+            else cursor + query,
+            sampling_params=NS(
+                extra_args={DESCRIPTOR_KEY: descriptor} if descriptor else {}
+            ),
+        )
+        for request_id, cursor, query, descriptor, _ in requests
+    }
+    starts = [0]
+    for r in requests:
+        starts.append(starts[-1] + r[2])
+    starts += [starts[-1]] * padding
+    fa = NS(
+        seq_lens=torch.tensor([r[1] + r[2] for r in requests] + [0] * padding),
+        query_start_loc=torch.tensor(starts),
+    )
+    positions = torch.cat(
+        [torch.arange(r[1], r[1] + r[2]) for r in requests]
+        + [torch.full((padding,), 99)]
+    )
+    return (
+        controller,
+        states,
+        {"layer0": metadata, "fa": fa},
+        positions,
+        {r[0]: r[2] for r in requests},
+    )
+
+
+@pytest.mark.parametrize("family", ["gdn", "mamba2"])
+def test_request_descriptors_route_mixed_rows_and_touch_only_selected_prefill_flag(
+    family,
+):
+    requests = [
+        (
+            "dec",
+            2,
+            1,
+            dict(operation_id="d", expected_prompt_tokens=3, start_cursor=2),
+            3,
+        ),
+        ("fresh", 0, 2, dict(operation_id="f", expected_prompt_tokens=2), 4),
+        (
+            "carry",
+            0,
+            3,
+            dict(operation_id="c", expected_prompt_tokens=3, restore_name="H"),
+            1,
+        ),
+    ]
+    controller, states, metadata, positions, counts = batch_controller(
+        family, requests, num_decodes=1
+    )
+    controller.store.capture("H", [slot(family=family, value=7.0)], {})
+    boundary = controller.before_forward(metadata, positions, counts, "PIECEWISE", 3)
+    assert torch.all(states[1][1] == 7)
+    assert torch.all(states[1][[0, 2, 3, 4, 5, 6, 7]] == -1)
+    current = metadata["layer0"]
+    flag = (
+        current.prefill_has_initial_state
+        if family == "gdn"
+        else current.has_initial_states_p
+    )
+    assert flag.tolist() == [False, True]
+    if family == "gdn":
+        assert current.has_initial_state.tolist() == [False, False, True]
+    controller.after_forward(boundary)
+    receipts = controller.results(["d", "f", "c"])
+    assert receipts["c"]["request_id"] == "carry"
+    assert receipts["c"]["forward_chunks"][0]["batch_row"] == 2
+    assert receipts["f"]["restored_from"] is None
+
+
+@pytest.mark.parametrize("family", ["gdn", "mamba2"])
+def test_graph_padded_decode_never_selects_null_state_or_modifies_padding_positions(
+    family,
+):
+    requests = [
+        (
+            "b",
+            4,
+            1,
+            dict(operation_id="b", expected_prompt_tokens=5, start_cursor=4),
+            2,
+        ),
+        (
+            "a",
+            0,
+            1,
+            dict(operation_id="a", expected_prompt_tokens=1, restore_name="H"),
+            5,
+        ),
+    ]
+    controller, states, metadata, positions, counts = batch_controller(
+        family, requests, num_decodes=2, padding=2
+    )
+    controller.store.capture("H", [slot(family=family, value=7.0)], {})
+    boundary = controller.before_forward(metadata, positions, counts, "FULL", 4)
+    assert torch.all(states[1][0] == -1)
+    assert torch.all(states[1][5] == 7)
+    assert positions[2:].tolist() == [99, 99]
+    controller.after_forward(boundary)
+    result = controller.results(["a", "b"])
+    chunk = result["a"]["forward_chunks"][0]
+    assert chunk["graph_mode"] == "FULL"
+    assert (chunk["batch_size"], chunk["padded_batch_size"]) == (2, 4)
+
+
+def test_invalid_second_request_rejects_whole_forward_before_first_restore():
+    requests = [
+        (
+            "a",
+            0,
+            2,
+            dict(operation_id="a", expected_prompt_tokens=2, restore_name="H"),
+            1,
+        ),
+        ("b", 1, 2, dict(operation_id="b", expected_prompt_tokens=3), 2),
+    ]
+    controller, states, metadata, positions, counts = batch_controller("gdn", requests)
+    controller.store.capture("H", [slot(value=7.0)], {})
+    with pytest.raises(CompactionContractError, match="start_cursor"):
+        controller.before_forward(metadata, positions, counts)
+    assert torch.all(states[1] == -1)
+    assert not metadata["layer0"].has_initial_state.any()
+
+
+def test_operation_id_cannot_be_shared_across_requests():
+    descriptor = dict(operation_id="same", expected_prompt_tokens=2)
+    requests = [("a", 0, 2, descriptor, 1), ("b", 0, 2, descriptor, 2)]
+    controller, states, metadata, positions, counts = batch_controller("gdn", requests)
+    with pytest.raises(CompactionContractError, match="reused"):
+        controller.before_forward(metadata, positions, counts)
+    assert torch.all(states[1] == -1)
+
+
+def test_requests_cannot_restore_into_an_aliased_native_slot():
+    requests = [
+        (
+            "a",
+            0,
+            2,
+            dict(operation_id="a", expected_prompt_tokens=2, restore_name="H"),
+            1,
+        ),
+        (
+            "b",
+            0,
+            2,
+            dict(operation_id="b", expected_prompt_tokens=2, restore_name="H"),
+            1,
+        ),
+    ]
+    controller, states, metadata, positions, counts = batch_controller("gdn", requests)
+    controller.store.capture("H", [slot(value=7.0)], {})
+    with pytest.raises(CompactionContractError, match="alias"):
+        controller.before_forward(metadata, positions, counts)
+    assert torch.all(states[1] == -1)
+
+
+def test_aborted_request_marks_only_its_operation_failed():
+    requests = [
+        ("a", 0, 2, dict(operation_id="a", expected_prompt_tokens=4), 1),
+        ("b", 0, 2, dict(operation_id="b", expected_prompt_tokens=4), 2),
+    ]
+    controller, _, metadata, positions, counts = batch_controller("gdn", requests)
+    controller.after_forward(controller.before_forward(metadata, positions, counts))
+    controller.finish_requests({"a"})
+    assert "aborted" in controller.operations["a"].failed
+    assert controller.operations["b"].failed is None
+
+
+@pytest.mark.parametrize("index", [0, -1, 8])
+def test_null_and_out_of_range_native_slots_are_rejected(index):
+    with pytest.raises(CompactionContractError, match="Invalid native state slot"):
+        slot(index=index)
+
+
+def test_reordering_between_chunks_keeps_state_and_capture_owned_by_request():
+    requests = [
+        (
+            "a",
+            0,
+            2,
+            dict(operation_id="a", expected_prompt_tokens=5, capture_name="A"),
+            1,
+        ),
+        (
+            "b",
+            0,
+            2,
+            dict(operation_id="b", expected_prompt_tokens=4, capture_name="B"),
+            2,
+        ),
+    ]
+    controller, states, metadata, positions, counts = batch_controller("gdn", requests)
+    controller.after_forward(controller.before_forward(metadata, positions, counts))
+    for component in states:
+        component[1].fill_(11)
+        component[2].fill_(22)
+    batch = controller.runner.input_batch
+    batch.req_ids = ["b", "a"]
+    batch.num_computed_tokens_cpu = [2, 2]
+    for request in controller.runner.requests.values():
+        request.num_computed_tokens = 2
+    metadata["layer0"].prefill_state_indices = torch.tensor([2, 1])
+    metadata["layer0"].non_spec_state_indices_tensor = torch.tensor([2, 1])
+    metadata["fa"].seq_lens = torch.tensor([4, 5])
+    metadata["fa"].query_start_loc = torch.tensor([0, 2, 5])
+    second = controller.before_forward(
+        metadata, torch.tensor([2, 3, 2, 3, 4]), {"a": 3, "b": 2}
+    )
+    controller.after_forward(second)
+    result = controller.results(["a", "b"])
+    assert result["a"]["forward_chunks"][1]["batch_row"] == 1
+    assert result["b"]["forward_chunks"][1]["batch_row"] == 0
+    target = slot()
+    controller.store.restore("A", [target])
+    assert torch.all(target.states[1][target.index] == 11)
+    controller.store.restore("B", [target])
+    assert torch.all(target.states[1][target.index] == 22)
+
+
+@pytest.mark.parametrize("finished_first", [False, True])
+def test_delivered_results_retire_large_operations_and_live_tombstones(finished_first):
+    descriptor = dict(operation_id="a", expected_prompt_tokens=2)
+    controller, _, metadata, positions, counts = batch_controller(
+        "gdn", [("request", 0, 2, descriptor, 1)]
+    )
+    controller.after_forward(controller.before_forward(metadata, positions, counts))
+    if finished_first:
+        controller.finish_requests({"request"})
+    result = controller.results(["a"])
+    assert result["a"]["forward_calls"] == 1
+    assert controller.operations == {}
+    if not finished_first:
+        assert controller.before_forward(metadata, positions, counts) is None
+        controller.finish_requests({"request"})
+    assert controller._descriptors == {}
+    assert controller._retired_bindings == {}
+    with pytest.raises(CompactionContractError, match="reused"):
+        controller.before_forward(metadata, positions, counts)
+
+
+@pytest.mark.parametrize("wrong_offset", [False, True])
+def test_kv_and_state_import_share_boundary_and_original_query_positions(wrong_offset):
+    from vllm.v1.worker.compaction_kv import NativeKVSnapshotStore
+
+    descriptor = dict(
+        operation_id="target",
+        expected_prompt_tokens=5,
+        restore_name="H",
+        restore_at=2,
+        kv_restore_name="K",
+        position_offset=3 if wrong_offset else 4,
+        capture_kv={"name": "roundtrip", "token_indices": [0, 1]},
+    )
+    controller, states, metadata, positions, counts = batch_controller(
+        "gdn", [("target", 0, 2, descriptor, 1)]
+    )
+    controller.store.capture("H", [slot(value=7.0)], {})
+    kv_store = object.__new__(NativeKVSnapshotStore)
+    kv_store._entries, kv_store._staged = {}, {}
+    cache = torch.arange(8 * 2 * 4 * 6, dtype=torch.float32).reshape(8, 2, 4, 6)
+    kv_store.layers = {
+        "fa": NS(
+            kv_cache=cache,
+            head_size=3,
+            num_kv_heads=2,
+            get_attn_backend=lambda: NS(get_name=lambda: "FLASH_ATTN"),
+        )
+    }
+    controller.kv_store = kv_store
+    metadata["fa"].block_table = torch.tensor([[1, 2]])
+    source = kv_store.capture(
+        {"name": "K", "token_indices": [0, 5]}, "history", 0, metadata, 6
+    )
+    cache.fill_(-9)
+    controller.after_forward(controller.before_forward(metadata, positions, counts))
+    controller.runner.requests["target"].num_computed_tokens = 2
+    controller.runner.input_batch.num_computed_tokens_cpu = [2]
+    metadata["fa"].seq_lens = torch.tensor([5])
+    metadata["fa"].query_start_loc = torch.tensor([0, 3])
+    positions = torch.arange(2, 5)
+    if wrong_offset:
+        with pytest.raises(CompactionContractError, match="original next-query"):
+            controller.before_forward(metadata, positions, {"target": 3})
+        assert torch.all(states[1] == -1)
+        assert torch.all(cache == -9)
+        assert positions.tolist() == [2, 3, 4]
+        return
+    boundary = controller.before_forward(metadata, positions, {"target": 3})
+    assert torch.all(states[1][1] == 7)
+    assert positions.tolist() == [6, 7, 8]
+    controller.after_forward(boundary)
+    result = controller.results(["target"])["target"]
+    assert result["fa_kv_imported"]
+    assert result["kv_capture"]["digest"] == source["digest"]
+    assert result["kv_capture"]["source_position_offset"] == 4
+    assert result["kv_restore"]["query_position_offset"] == 4
+    with pytest.raises(ValueError, match="Repeated selected-KV"):
+        kv_store.validate_restore("roundtrip", "second-retention", 0, metadata, 2)
+    # Offset remains owned by the live request after the receipt is delivered.
+    controller.runner.requests["target"].num_computed_tokens = 5
+    controller.runner.input_batch.num_computed_tokens_cpu = [5]
+    positions = torch.tensor([5])
+    controller.before_forward(metadata, positions, {"target": 1}, "FULL", 1)
+    assert positions.item() == 9
+    controller.finish_requests({"target"})
+    assert not controller._position_rules
+
+
+@pytest.mark.parametrize("family", ["gdn", "mamba2"])
+def test_uninstrumented_fresh_one_token_decode_row_is_zeroed_at_runner_level(family):
+    """Summary generation and validation natives carry no descriptor; a
+    budget-limited 1-token first slice on the decode path must still start
+    from a zero slot, while prefill rows and continuing rows are untouched."""
+    controller, states, metadata, positions, counts = batch_controller(
+        family,
+        [("fresh", 0, 1, None, 3), ("continuing", 7, 1, None, 5)],
+        num_decodes=2,
+    )
+    assert controller.before_forward(metadata, positions, counts, "FULL", 2) is None
+    for state in states:
+        assert torch.all(state[3] == 0)
+        assert torch.all(state[5] == -1)
+    assert controller.fresh_decode_rows_zeroed == 1
+    assert controller.info()["fresh_decode_rows_zeroed"] == 1
+    # A fresh multi-token slice takes the prefill path; its slot is left alone.
+    controller2, states2, metadata2, positions2, counts2 = batch_controller(
+        family, [("fresh_prefill", 0, 4, None, 2)]
+    )
+    assert controller2.before_forward(metadata2, positions2, counts2) is None
+    for state in states2:
+        assert torch.all(state[2] == -1)
+    assert controller2.fresh_decode_rows_zeroed == 0
