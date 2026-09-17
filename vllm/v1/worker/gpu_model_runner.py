@@ -246,6 +246,7 @@ from .utils import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+    from vllm.v1.worker.compaction import NativeCompactionController
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
@@ -469,6 +470,7 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.compaction: NativeCompactionController | None = None
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -4448,13 +4450,26 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            compaction = self.compaction
+            boundary = (
+                compaction.before_forward(attn_metadata, positions)
+                if compaction is not None
+                else None
             )
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            except Exception as error:
+                if compaction is not None:
+                    compaction.fail_forward(error)
+                raise
+            if compaction is not None:
+                compaction.after_forward(boundary)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

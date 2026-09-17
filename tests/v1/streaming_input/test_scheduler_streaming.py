@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from vllm.config import DeviceConfig, VllmConfig
@@ -14,7 +16,11 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import EngineCoreRequest, FinishReason
+from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -80,6 +86,168 @@ def create_scheduler() -> Scheduler:
         block_size=16,
         hash_block_size=16,
     )
+
+
+def create_compaction_engine():
+    """Real scheduler/cache/frontend, with only input processing and GPU mocked."""
+    scheduler = create_scheduler()
+    scheduler.max_num_running_reqs = 1
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.async_scheduling = False
+    core.batch_queue = None
+    core._compaction_session_enabled = True
+    engine = LLMEngine.__new__(LLMEngine)
+    engine._compaction_session_ids = set()
+    engine.model_config = scheduler.vllm_config.model_config
+    engine.output_processor = OutputProcessor(None, log_stats=False)
+    engine.get_supported_tasks = lambda: ("generate",)
+
+    def process_inputs(request_id, prompt, params, **kwargs):
+        return EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=prompt["prompt_token_ids"],
+            mm_features=None,
+            sampling_params=params,
+            pooling_params=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            resumable=kwargs["resumable"],
+        )
+
+    engine.input_processor = SimpleNamespace(
+        process_inputs=process_inputs,
+        assign_request_id=InputProcessor.assign_request_id,
+    )
+    engine.engine_core = SimpleNamespace(
+        engine_core=core,
+        add_request=lambda req: scheduler.add_request(
+            Request.from_engine_core_request(req, None)
+        ),
+    )
+    return engine, core
+
+
+def complete_compaction_chunk(engine, core, token_id=99):
+    scheduled = core.scheduler.schedule()
+    ids = list(scheduled.num_scheduled_tokens)
+    assert len(ids) == 1
+    output = ModelRunnerOutput(
+        req_ids=ids,
+        req_id_to_index={ids[0]: 0},
+        sampled_token_ids=[[token_id]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = core.scheduler.update_from_output(scheduled, output)
+    result = engine.output_processor.process_outputs(outputs[0].outputs)
+    return result.request_outputs[0]
+
+
+def test_native_reader_append_preserves_cache_and_discards_only_unconsumed_sample():
+    engine, core = create_compaction_engine()
+    initial_free = core.compaction_status()["num_free_blocks"]
+    first = list(range(17))
+    session_id = engine.add_compaction_input(first)
+    first[0] = 999  # Caller mutation cannot change submitted inputs.
+    first_output = complete_compaction_chunk(engine, core)
+    before = engine.compaction_status(session_id)
+    assert first_output.outputs[0].finish_reason == "length"
+    assert first_output.outputs[0].token_ids == [99]
+    assert not first_output.finished
+    assert before["num_computed_tokens"] == 17
+    assert before["block_counts"] == [2]
+
+    appended = list(range(20, 37))
+    assert engine.add_compaction_input(appended, session_id) == session_id
+    request = core.scheduler.requests[session_id]
+    assert request.num_computed_tokens == 17
+    assert request.prompt_token_ids == list(range(17)) + appended
+    assert 99 not in request.all_token_ids
+    assert request.prompt_token_ids is not (
+        engine.output_processor.request_states[session_id].prompt_token_ids
+    )
+    second_output = complete_compaction_chunk(engine, core, token_id=100)
+    after = engine.compaction_status(session_id)
+    assert after["num_computed_tokens"] == 34
+    assert after["block_counts"] == [3]
+    assert after["block_ids"][0][:2] == before["block_ids"][0]
+    assert second_output.outputs[0].token_ids == [100]
+    assert not second_output.finished
+
+    released = engine.release_compaction_session(session_id)
+    assert released["freed_block_count"] == 3
+    assert released["after"]["num_free_blocks"] == initial_free
+    assert not released["after"]["request_exists"]
+    assert released["frontend_removed"]
+    assert not core.scheduler.requests
+    assert not engine.output_processor.has_unfinished_requests()
+    with pytest.raises(ValueError, match="Unknown"):
+        engine.compaction_status(session_id)
+
+
+def test_native_reader_rejects_active_chunk_and_cumulative_overflow():
+    engine, core = create_compaction_engine()
+    session_id = engine.add_compaction_input([1, 2, 3])
+    for action in (
+        lambda: engine.add_compaction_input([4], session_id),
+        lambda: engine.release_compaction_session(session_id),
+        lambda: core.release_compaction_session(session_id),
+        lambda: engine.add_compaction_input([4]),
+    ):
+        with pytest.raises(RuntimeError):
+            action()
+    complete_compaction_chunk(engine, core)
+    before = engine.compaction_status(session_id)
+    with pytest.raises(ValueError, match="Cumulative"):
+        engine.add_compaction_input([4] * 1021, session_id)
+    assert engine.compaction_status(session_id) == before
+
+
+@pytest.mark.parametrize("violation", ["queued", "inflight", "preempted"])
+def test_native_reader_release_rejects_nonquiescent_state_without_freeing(violation):
+    engine, core = create_compaction_engine()
+    session_id = engine.add_compaction_input([1, 2, 3])
+    complete_compaction_chunk(engine, core)
+    free_before = core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    request = core.scheduler.requests[session_id]
+    if violation == "queued":
+        request.streaming_queue.append(None)
+    elif violation == "inflight":
+        request.num_in_flight_tokens = 1
+    else:
+        request.num_preemptions = 1
+    with pytest.raises(RuntimeError, match="completed, unpreempted"):
+        engine.release_compaction_session(session_id)
+    assert core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == (
+        free_before
+    )
+    assert session_id in core.scheduler.requests
+
+
+@pytest.mark.parametrize("tokens", [[], [True], [-1], [1.5]])
+def test_native_reader_rejects_invalid_tokens_before_admission(tokens):
+    engine, core = create_compaction_engine()
+    with pytest.raises(ValueError, match="integer token IDs"):
+        engine.add_compaction_input(tokens)
+    assert not core.scheduler.requests
+
+
+def test_native_reader_requires_native_installation_receipt():
+    engine, core = create_compaction_engine()
+    core._compaction_session_enabled = False
+    core.model_executor = SimpleNamespace(
+        collective_rpc=lambda *args: [{"backend": "extension"}]
+    )
+    core.collective_rpc("cc_install")
+    with pytest.raises(RuntimeError, match="cc_install"):
+        engine.add_compaction_input([1])
+    core.model_executor.collective_rpc = lambda *args: [{"backend": "vllm_native"}]
+    core.collective_rpc("cc_install")
+    assert engine.add_compaction_input([1]) in core.scheduler.requests
 
 
 class TestStreamingScheduler(unittest.TestCase):

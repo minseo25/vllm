@@ -90,6 +90,7 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.worker.compaction import NativeCompactionController
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -1165,6 +1166,62 @@ class Worker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+
+    def cc_install(self) -> dict:
+        """Enable native request-boundary compaction after cache initialization."""
+        from vllm.v1.worker.compaction import (
+            CompactionContractError,
+            NativeCompactionController,
+        )
+
+        if self.use_v2_model_runner:
+            raise CompactionContractError("Compaction requires V1 GPUModelRunner")
+        if self.model_runner.compaction is not None:
+            raise CompactionContractError("Native compaction is already enabled")
+        controller = NativeCompactionController(self.model_runner)
+        self.model_runner.compaction = controller
+        return controller.info()
+
+    def _cc_controller(self) -> "NativeCompactionController":
+        from vllm.v1.worker.compaction import CompactionContractError
+
+        controller = getattr(self.model_runner, "compaction", None)
+        if controller is None:
+            raise CompactionContractError("Call cc_install first")
+        return controller
+
+    def cc_arm(
+        self,
+        capture_name: str | None = None,
+        restore_name: str | None = None,
+        expected_prompt_tokens: int | None = None,
+        start_cursor: int = 0,
+        expected_request_id: str | None = None,
+    ) -> dict:
+        """Arm one subsequent request for native-state capture and/or restore."""
+        return self._cc_controller().arm(
+            capture_name,
+            restore_name,
+            expected_prompt_tokens,
+            start_cursor,
+            expected_request_id,
+        )
+
+    def cc_result(self) -> dict:
+        """Return the last request receipt and disarm its compaction operation."""
+        return self._cc_controller().result()
+
+    def cc_snapshots(self) -> dict:
+        """Return metadata for the worker's immutable CPU state snapshots."""
+        return self._cc_controller().snapshots()
+
+    def cc_drop(self, name: str) -> dict:
+        """Release a snapshot which is not used by an active operation."""
+        return self._cc_controller().drop(name)
+
+    def cc_compare(self, name_a: str, name_b: str) -> dict:
+        """Relative Frobenius differences between two immutable snapshots."""
+        return self._cc_controller().compare(name_a, name_b)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

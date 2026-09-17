@@ -436,6 +436,122 @@ class EngineCore:
             )
         return metadata
 
+    def compaction_status(self, session_id: str | None = None) -> dict[str, Any]:
+        """Inspect an idle engine or a quiescent, native reader session.
+
+        Args:
+            session_id: Internal request ID, or None to inspect engine idleness.
+
+        Returns:
+            Actual scheduler cursor, cache groups, block IDs and pool counts.
+
+        Raises:
+            RuntimeError: Native installation or quiescent-session checks fail.
+            ValueError: The requested session is unknown.
+        """
+        if getattr(self, "_compaction_session_enabled", False) is not True:
+            raise RuntimeError("Install native compaction with cc_install first")
+        scheduler = self.scheduler
+        if (
+            self.async_scheduling is not False
+            or self.batch_queue is not None
+            or scheduler.max_num_running_reqs != 1
+            or scheduler.vllm_config.cache_config.enable_prefix_caching
+            or scheduler.connector is not None
+            or scheduler.ec_connector is not None
+        ):
+            raise RuntimeError(
+                "Compaction requires synchronous B1 without cache sharing"
+            )
+        pool = scheduler.kv_cache_manager.block_pool
+        common = {
+            "session_id": session_id,
+            "idle": not scheduler.requests,
+            "request_exists": session_id in scheduler.requests,
+            "request_count": len(scheduler.requests),
+            "free_blocks": pool.get_num_free_blocks(),
+            "num_free_blocks": pool.get_num_free_blocks(),
+            "total_blocks": pool.num_gpu_blocks,
+            "cache_groups": self.get_kv_cache_group_metadata(),
+            "block_ids": [],
+            "block_counts": [],
+        }
+        if session_id is None:
+            return common
+        request = scheduler.requests.get(session_id)
+        if request is None:
+            raise ValueError("Unknown native compaction session")
+        params = request.sampling_params
+        if (
+            len(scheduler.requests) != 1
+            or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+            or not request.resumable
+            or request.streaming_queue is None
+            or request.streaming_queue
+            or params is None
+            or not (params.extra_args or {}).get("native_compaction_session")
+            or request.max_tokens != 1
+            or params.max_tokens != 1
+            or request.num_computed_tokens != request.num_prompt_tokens
+            or request.num_output_tokens != 1
+            or request.num_in_flight_tokens
+            or request.num_output_placeholders
+            or request.num_preemptions
+            or request.last_sched_seq > scheduler.processed_step_seq
+        ):
+            raise RuntimeError("Session is not a completed, unpreempted reader chunk")
+        blocks = scheduler.kv_cache_manager.get_blocks(session_id)
+        return {
+            **common,
+            "status": request.status.name,
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "num_computed_tokens": request.num_computed_tokens,
+            "unconsumed_sample_tokens": request.num_output_tokens,
+            "block_ids": [list(group) for group in blocks.get_block_ids()],
+            "block_refcounts": [
+                [block.ref_cnt for block in group] for group in blocks.blocks
+            ],
+            "block_counts": [len(group) for group in blocks.blocks],
+            "native_compaction_session": True,
+        }
+
+    def release_compaction_session(self, session_id: str) -> dict[str, Any]:
+        """Free a completed reader epoch before admitting a compacted epoch.
+
+        This returns physical blocks to vLLM's pool; it does not deallocate the
+        reserved CUDA pool. Worker request metadata is retired on the next step.
+        """
+        before = self.compaction_status(session_id)
+        scheduler = self.scheduler
+        blocks = scheduler.kv_cache_manager.get_blocks(session_id)
+        owned = {
+            block.block_id: block
+            for group in blocks.blocks
+            for block in group
+            if not block.is_null
+        }
+        if any(block.ref_cnt != 1 for block in owned.values()):
+            raise RuntimeError("Compaction cannot release shared cache blocks")
+        scheduler.finish_requests(session_id, RequestStatus.FINISHED_ABORTED)
+        after = self.compaction_status(None)
+        freed = after["free_blocks"] - before["free_blocks"]
+        if (
+            session_id in scheduler.requests
+            or any(block.ref_cnt != 0 for block in owned.values())
+            or freed != len(owned)
+        ):
+            raise RuntimeError("Compaction did not release all owned cache blocks")
+        return {
+            "session_id": session_id,
+            "before": before,
+            "after": after,
+            "released_block_ids": sorted(owned),
+            "freed_block_count": freed,
+            "scheduler_removed": True,
+            "worker_cleanup_on_next_step": True,
+            "cuda_pool_deallocated": False,
+        }
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
@@ -957,7 +1073,15 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        result = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        if (
+            method == "cc_install"
+            and len(result) == 1
+            and isinstance(result[0], dict)
+            and result[0].get("backend") == "vllm_native"
+        ):
+            self._compaction_session_enabled = True
+        return result
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version

@@ -6,6 +6,7 @@ import weakref
 from collections.abc import Callable, Mapping
 from copy import copy
 from typing import Any
+from uuid import uuid4
 
 import torch.nn as nn
 from typing_extensions import TypeVar
@@ -23,7 +24,7 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
@@ -87,6 +88,7 @@ class LLMEngine:
         else:
             self.dp_group = None
         self.should_execute_dummy_batch = False
+        self._compaction_session_ids: set[str] = set()
 
         self.renderer = renderer = renderer_from_config(self.vllm_config)
 
@@ -214,6 +216,114 @@ class LLMEngine:
 
         request_ids = self.output_processor.abort_requests(request_ids, internal)
         self.engine_core.abort_requests(request_ids)
+
+    def _compaction_utility(self, method: str, *args: Any) -> dict[str, Any]:
+        client = self.engine_core
+        if utility := getattr(client, "call_utility", None):
+            return utility(method, *args)
+        if core := getattr(client, "engine_core", None):
+            return getattr(core, method)(*args)
+        raise RuntimeError("Compaction requires a synchronous EngineCore client")
+
+    def add_compaction_input(
+        self, prompt_token_ids: list[int], session_id: str | None = None
+    ) -> str:
+        """Start or append to a native, one-sample resumable reader session.
+
+        Args:
+            prompt_token_ids: New input tokens only, already serialized by caller.
+            session_id: Internal ID returned by the first call, or None to start.
+
+        Returns:
+            The stable internal session ID. Call step() until a per-chunk output
+            has a finish_reason; its overall finished flag remains False. The
+            single sampled token is never consumed and is discarded on append.
+
+        Raises:
+            ValueError: Input is invalid or would exceed the live context limit.
+            RuntimeError: Native cc_install is absent or a chunk is still active.
+        """
+        if (
+            not isinstance(prompt_token_ids, list)
+            or not prompt_token_ids
+            or any(type(token) is not int or token < 0 for token in prompt_token_ids)
+        ):
+            raise ValueError("Compaction input must be nonempty integer token IDs")
+        if session_id is None:
+            if self.output_processor.has_unfinished_requests():
+                raise RuntimeError(
+                    "Release existing requests before starting a session"
+                )
+            status = self._compaction_utility("compaction_status", None)
+            if not status["idle"]:
+                raise RuntimeError("EngineCore has an existing request")
+            cursor = 0
+            external_id = f"compaction-{uuid4().hex}"
+        else:
+            state = self._compaction_frontend_state(session_id)
+            status = self._compaction_utility("compaction_status", session_id)
+            cursor = status["num_computed_tokens"]
+            external_id = state.external_req_id
+        if cursor + len(prompt_token_ids) + 1 > self.model_config.max_model_len:
+            raise ValueError(
+                "Cumulative compaction input plus sample exceeds max_model_len"
+            )
+
+        params = SamplingParams(
+            temperature=0,
+            max_tokens=1,
+            seed=0,
+            ignore_eos=True,
+            output_kind=RequestOutputKind.DELTA,
+            logprobs=5,
+            extra_args={"native_compaction_session": True},
+        )
+        request = self.input_processor.process_inputs(
+            request_id=external_id if session_id is None else session_id,
+            prompt={"prompt_token_ids": prompt_token_ids.copy()},
+            params=params,
+            supported_tasks=self.get_supported_tasks(),
+            resumable=True,
+        )
+        if session_id is None:
+            self.input_processor.assign_request_id(request)
+        else:
+            request.external_req_id = external_id
+        self.output_processor.add_request(request, None, None, 0)
+        # InprocClient must not share a growing prompt list with the frontend.
+        assert request.prompt_token_ids is not None
+        request.prompt_token_ids = request.prompt_token_ids.copy()
+        self.engine_core.add_request(request)
+        self._compaction_session_ids.add(request.request_id)
+        return request.request_id
+
+    def _compaction_frontend_state(self, session_id: str):
+        if session_id not in self._compaction_session_ids:
+            raise ValueError("Unknown native compaction session")
+        state = self.output_processor.request_states.get(session_id)
+        if (
+            state is None
+            or not state.streaming_input
+            or state.input_chunk_queue is not None
+        ):
+            raise RuntimeError("Consume the current chunk's finish output first")
+        return state
+
+    def compaction_status(self, session_id: str) -> dict[str, Any]:
+        """Return quiescent native session cursor and actual block ownership."""
+        self._compaction_frontend_state(session_id)
+        return self._compaction_utility("compaction_status", session_id)
+
+    def release_compaction_session(self, session_id: str) -> dict[str, Any]:
+        """Release a quiescent session's scheduler blocks and frontend state."""
+        self._compaction_frontend_state(session_id)
+        receipt = self._compaction_utility("release_compaction_session", session_id)
+        removed = self.output_processor.abort_requests([session_id], internal=True)
+        if removed != [session_id]:
+            raise RuntimeError("Compaction frontend cleanup did not match the session")
+        self._compaction_session_ids.remove(session_id)
+        receipt["frontend_removed"] = True
+        return receipt
 
     def add_request(
         self,
