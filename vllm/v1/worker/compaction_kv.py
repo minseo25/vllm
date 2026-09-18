@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 from typing import Any
 
 import torch
@@ -607,6 +608,135 @@ class NativeKVSnapshotStore:
             "bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
             "digest": _digest(tensors),
             "digest_verified_at": "subset",
+            "tensors": tensors,
+            **self._bias_fields(beta),
+        }
+        return self.describe(name)
+
+    # ------------------------------------------------------------ bias mask
+    def bias_mask(
+        self,
+        name: str,
+        source: str,
+        *,
+        token_indices: list[int],
+        value: float,
+        heads: list[int] | None = None,
+    ) -> dict:
+        """Copy ``source`` with its bias set to ``value`` on the listed tokens.
+
+        A kernel-level control for the bias path: ``beta = -20`` on a token set
+        ``D`` must attend like ``subset(all \\ D)`` (residual mass ``exp(-20)``)
+        while differing from the full snapshot; a ``heads`` subset must differ
+        from both. The K/V rows, cursor, positions and ``request_id`` are the
+        source's (``digest`` is unchanged); other rows keep their bias, a
+        bias-less source starts from zero; ``heads`` (default all) lists the kv
+        heads to set. Refused on a store whose backend cannot apply the bias.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("KV snapshot name must be nonempty")
+        if name in self._entries:
+            raise ValueError("KV snapshot names cannot be overwritten")
+        origin = self._entries.get(source)
+        if origin is None:
+            raise ValueError(f"Unknown KV snapshot: {source}")
+        if origin["layer_token_indices"] is None:
+            raise ValueError("Source snapshot records no token indices to mask")
+        if not self.bias_supported():
+            raise ValueError(UNSUPPORTED_MESSAGE)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError("bias value must be a finite number")
+        tokens = _validate_index_list(token_indices, origin["source_cursor"])
+        num_kv_heads = {
+            self._check_layout(layer_name, layer).shape[1]
+            for layer_name, layer in self.layers.items()
+        }
+        if len(num_kv_heads) != 1:
+            raise ValueError("FA layers disagree on the kv head count")
+        kv_heads = num_kv_heads.pop()
+        if heads is None:
+            head_list = list(range(kv_heads))
+        elif (
+            not isinstance(heads, list)
+            or not heads
+            or any(type(h) is not int or not 0 <= h < kv_heads for h in heads)
+            or heads != sorted(set(heads))
+        ):
+            raise ValueError(
+                f"heads must be unique ascending kv head indices below {kv_heads}"
+            )
+        else:
+            head_list = list(heads)
+        head_index = torch.tensor(head_list, dtype=torch.long)
+        tensors, beta, rows_per_layer = {}, {}, {}
+        for layer_name in self.layers:
+            available = origin["layer_token_indices"][layer_name]
+            position_of = {token: row for row, token in enumerate(available)}
+            missing = [t for t in tokens if t not in position_of]
+            if missing:
+                raise ValueError(
+                    f"Bias-mask tokens are not in the source snapshot ({layer_name}): "
+                    f"{missing[:8]}"
+                )
+            rows = torch.tensor([position_of[t] for t in tokens], dtype=torch.long)
+            rows_per_layer[layer_name] = rows.tolist()
+            tensors[layer_name] = origin["tensors"][layer_name].contiguous().clone()
+            if origin.get("beta"):
+                layer_beta = origin["beta"][layer_name].clone()
+            else:
+                layer_beta = torch.zeros(
+                    (origin["retained_tokens"], kv_heads), dtype=KV_BIAS_DTYPE
+                )
+            layer_beta[rows[:, None], head_index[None, :]] = float(value)
+            beta[layer_name] = layer_beta.contiguous()
+        method = {
+            "name": "bias_mask",
+            "params": {
+                "token_indices": list(tokens),
+                "value": float(value),
+                "heads": head_list,
+                "all_heads": heads is None,
+                "rows_per_layer": rows_per_layer,
+            },
+            "inputs": {
+                "source": source,
+                "source_digest": origin["digest"],
+                "source_bias_digest": origin.get("bias_digest"),
+            },
+        }
+        self._entries[name] = {
+            "name": name,
+            "request_id": origin["request_id"],
+            "source_cursor": origin["source_cursor"],
+            "source_position_offset": origin["source_position_offset"],
+            "source_absolute_next_position": origin["source_absolute_next_position"],
+            "selection_policy": "bias_mask",
+            "token_indices": (
+                list(origin["token_indices"])
+                if origin["token_indices"] is not None
+                else None
+            ),
+            "layer_token_indices": {
+                k: list(v) for k, v in origin["layer_token_indices"].items()
+            },
+            "retained_tokens": origin["retained_tokens"],
+            "synthetic": True,
+            "method": validate_method(method),
+            "derived_from": {
+                "name": source,
+                "digest": origin["digest"],
+                "bias_digest": origin.get("bias_digest"),
+                "retained_tokens": origin["retained_tokens"],
+                "selection_policy": origin["selection_policy"],
+                "synthetic": origin["synthetic"],
+            },
+            "bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
+            "digest": _digest(tensors),
+            "digest_verified_at": "bias_mask",
             "tensors": tensors,
             **self._bias_fields(beta),
         }

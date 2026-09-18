@@ -652,6 +652,7 @@ def test_triton_unified_attn_use_td_tile_clamp(
 
 from tests.kernels.attention.kv_bias_reference import (  # noqa: E402
     check_attention_bias,
+    check_bias_mask_equals_eviction,
     check_block_reuse_reads_zero_bias,
     check_cache_write_zeroes_bias,
 )
@@ -699,3 +700,18 @@ def test_triton_reshape_and_cache_zeroes_kv_bias_of_written_slots() -> None:
 @torch.inference_mode()
 def test_block_reused_after_a_bias_import_attends_with_zero_bias() -> None:
     check_block_reuse_reads_zero_bias(torch.device("cuda"), torch.bfloat16)
+
+
+@requires_cuda
+@pytest.mark.parametrize("query_len", [1, 5])
+@torch.inference_mode()
+def test_bias_mask_of_minus_20_attends_like_eviction(query_len: int) -> None:
+    """kv_bias_mask control: beta=-20 on D == cache without D, != full; head-0
+    mask differs from both (bias in prefill and decode, right slot and head)."""
+    check_bias_mask_equals_eviction(
+        torch.device("cuda"),
+        torch.bfloat16,
+        query_len=query_len,
+        atol=1.5e-2,
+        rtol=1e-2,
+    )

@@ -294,6 +294,89 @@ def check_block_reuse_reads_zero_bias(device, dtype, *, block_size=16, seed=0) -
     assert torch.equal(reused, plain)
 
 
+def check_bias_mask_equals_eviction(
+    device, dtype, *, query_len, block_size=16, atol, rtol, seed=0
+) -> None:
+    """Harness control at the kernel level (``kv_bias_mask``): ``beta = -20`` on a
+    token set ``D`` of the context must attend like a cache with ``D`` evicted
+    (residual mass ``exp(-20)``) while differing from the full cache; a head-0
+    mask must differ from both and match the per-head reference. Catches a bias
+    added before scaling, to the wrong slot/head, or only in decode."""
+    torch.manual_seed(seed)
+    num_blocks, num_kv_heads, num_heads, head_size = 12, 2, 4, 32
+    kv_len = 2 * block_size + 13
+    context_len = kv_len - query_len
+    dropped = [0, 3, 17, 18, 30, context_len - 1]
+    assert max(dropped) < context_len
+    kept = [t for t in range(kv_len) if t not in dropped]
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.tensor([[4, 7, 2]], dtype=torch.int32, device=device)
+    query = torch.randn(query_len, num_heads, head_size, dtype=dtype, device=device)
+    scale = head_size**-0.5
+    full_args = (
+        query,
+        key_cache,
+        value_cache,
+        [query_len],
+        [kv_len],
+        block_table,
+        scale,
+    )
+    out_full = run_unified_attention(*full_args, 0, None)
+
+    def masked_bias(heads):
+        bias = torch.zeros(
+            num_blocks, num_kv_heads, block_size, dtype=torch.float32, device=device
+        )
+        for t in dropped:
+            block = int(block_table[0, t // block_size])
+            bias[block, heads, t % block_size] = -20.0
+        return bias
+
+    out_mask = run_unified_attention(*full_args, 0, masked_bias(slice(None)))
+    # Eviction: the kept tokens re-laid contiguously in fresh blocks, no bias.
+    blocks_of = lambda t: int(block_table[0, t // block_size])  # noqa: E731
+    kept_k = torch.stack([key_cache[blocks_of(t), t % block_size] for t in kept])
+    kept_v = torch.stack([value_cache[blocks_of(t), t % block_size] for t in kept])
+    evicted_k = torch.zeros_like(key_cache)
+    evicted_v = torch.zeros_like(value_cache)
+    evicted_table = torch.tensor([[1, 9, 5]], dtype=torch.int32, device=device)
+    for i in range(len(kept)):
+        block = int(evicted_table[0, i // block_size])
+        evicted_k[block, i % block_size] = kept_k[i]
+        evicted_v[block, i % block_size] = kept_v[i]
+    out_evict = run_unified_attention(
+        query,
+        evicted_k,
+        evicted_v,
+        [query_len],
+        [len(kept)],
+        evicted_table,
+        scale,
+        0,
+        None,
+    )
+    torch.testing.assert_close(out_mask, out_evict, atol=atol, rtol=rtol)
+    assert not torch.allclose(out_mask, out_full, atol=atol, rtol=rtol)
+    # Head 0 only: differs from both, equals the per-head reference.
+    out_h0 = run_unified_attention(*full_args, 0, masked_bias(0))
+    assert not torch.allclose(out_h0, out_full, atol=atol, rtol=rtol)
+    assert not torch.allclose(out_h0, out_evict, atol=atol, rtol=rtol)
+    ref_h0 = ref_paged_attn_with_bias(*full_args, masked_bias(0))
+    torch.testing.assert_close(out_h0, ref_h0, atol=atol, rtol=rtol)
+    group = num_heads // num_kv_heads
+    # Query heads of kv head 1 are untouched by a head-0 mask.
+    torch.testing.assert_close(
+        out_h0[:, group:], out_full[:, group:], atol=atol, rtol=rtol
+    )
+    assert not torch.allclose(
+        out_h0[:, :group], out_full[:, :group], atol=atol, rtol=rtol
+    )
+
+
 def run_all_checks(device, dtype, *, atol, rtol) -> dict:
     errors = {
         "prefill_decode_2d": check_attention_bias(
@@ -319,4 +402,8 @@ def run_all_checks(device, dtype, *, atol, rtol) -> dict:
     }
     check_cache_write_zeroes_bias(device, dtype)
     check_block_reuse_reads_zero_bias(device, dtype)
+    for query_len in (1, 5):  # decode and prefill over a compacted context
+        check_bias_mask_equals_eviction(
+            device, dtype, query_len=query_len, atol=atol, rtol=rtol
+        )
     return errors

@@ -680,3 +680,156 @@ def test_block_reused_after_an_import_reads_zero_bias():
         zero_kv_bias_slots(layer.bias_cache, torch.tensor([22, 23]))
         assert not layer.bias_cache[5].any()
         assert layer.kv_cache[5, :, :3, :].eq(4.0).all()  # rows are untouched
+
+
+# ---------------------------------------------------------------- bias mask
+
+
+def test_bias_mask_sets_beta_on_listed_rows_and_keeps_kv_rows_and_digest():
+    store, layers, metadata = bias_store()
+    full = store.capture(
+        {"name": "full", "token_indices": list(range(6))}, "s", 0, metadata, 6
+    )
+    assert full["has_bias"] is False
+    masked = store.bias_mask("mask", "full", token_indices=[1, 4], value=-20.0)
+    assert masked["selection_policy"] == "bias_mask" and masked["synthetic"] is True
+    assert masked["has_bias"] is True and masked["bias_bytes"] == 2 * 6 * 2 * 4
+    assert masked["digest"] == full["digest"]  # K/V rows untouched
+    assert masked["bias_digest"] != full["bias_digest"] and masked["bias_digest"]
+    assert masked["digest_verified_at"] == "bias_mask"
+    assert masked["token_indices"] == list(range(6))
+    assert masked["layer_token_indices"] == full["layer_token_indices"]
+    assert masked["retained_tokens"] == 6 and masked["bytes"] == full["bytes"]
+    assert (masked["source_cursor"], masked["request_id"]) == (6, "s")
+    assert masked["derived_from"] == {
+        "name": "full",
+        "digest": full["digest"],
+        "bias_digest": None,
+        "retained_tokens": 6,
+        "selection_policy": "shared",
+        "synthetic": False,
+    }
+    assert masked["method"]["name"] == "bias_mask"
+    assert masked["method"]["params"] == {
+        "token_indices": [1, 4],
+        "value": -20.0,
+        "heads": [0, 1],
+        "all_heads": True,
+        "rows_per_layer": {"a": [1, 4], "b": [1, 4]},
+    }
+    expected = torch.zeros(6, 2)
+    expected[[1, 4]] = -20.0
+    for name in layers:
+        assert torch.equal(
+            store.snapshot_rows("mask")[name], store.snapshot_rows("full")[name]
+        )
+        assert torch.equal(store.snapshot_bias("mask")[name], expected)
+    # A bias source keeps its other rows; a head subset sets only those heads.
+    head0 = store.bias_mask("h0", "mask", token_indices=[0, 4], value=3.0, heads=[0])
+    assert head0["method"]["params"]["heads"] == [0]
+    assert head0["method"]["params"]["all_heads"] is False
+    assert head0["derived_from"]["bias_digest"] == masked["bias_digest"]
+    expected_h0 = expected.clone()
+    expected_h0[[0, 4], 0] = 3.0
+    for name in layers:
+        assert torch.equal(store.snapshot_bias("h0")[name], expected_h0)
+        assert torch.equal(store.snapshot_bias("mask")[name], expected)  # unchanged
+    # Import writes the masked bias at the rows' slots; K/V equal the source.
+    before = {n: layer.kv_cache.clone() for n, layer in layers.items()}
+    for layer in layers.values():
+        layer.bias_cache.fill_(9.0)
+    store.restore("h0", "target", 1, metadata, 6)  # row 1 -> blocks 5, 6
+    for name, layer in layers.items():
+        got = torch.cat([layer.bias_cache[5].T, layer.bias_cache[6, :, :2].T])
+        assert torch.equal(got, expected_h0)
+        assert torch.all(layer.bias_cache[6, :, 2:] == 9.0)
+        source_rows = store.snapshot_rows("full")[name]
+        written = torch.cat(
+            [
+                layer.kv_cache[5].transpose(0, 1),
+                layer.kv_cache[6, :, :2].transpose(0, 1),
+            ]
+        )
+        assert torch.equal(written, source_rows)
+    del before
+
+
+def test_bias_mask_works_on_per_layer_sources_and_survives_subsets():
+    store, layers, metadata = bias_store()
+    store.capture(
+        {"name": "pl", "layer_token_indices": {"a": [0, 1, 5], "b": [1, 3, 4]}},
+        "s",
+        0,
+        metadata,
+        6,
+    )
+    masked = store.bias_mask("m", "pl", token_indices=[1], value=-20.0)
+    assert masked["token_indices"] is None  # inherited from the per-layer source
+    assert masked["method"]["params"]["rows_per_layer"] == {"a": [1], "b": [0]}
+    for name, row in (("a", 1), ("b", 0)):
+        beta = store.snapshot_bias("m")[name]
+        assert torch.all(beta[row] == -20.0) and int(beta.ne(0).sum()) == 2
+    # A token recorded for one layer only is refused before anything is created.
+    with pytest.raises(ValueError, match=r"not in the source snapshot \(b\)"):
+        store.bias_mask("m2", "pl", token_indices=[5], value=-20.0)
+    assert "m2" not in store.list()["snapshots"]
+    sub = store.subset(
+        "s2", "m", method=method_record(), layer_token_indices={"a": [1], "b": [3]}
+    )
+    assert sub["has_bias"] is True
+    assert torch.equal(store.snapshot_bias("s2")["a"], torch.full((1, 2), -20.0))
+    assert not store.snapshot_bias("s2")["b"].any()
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        (dict(token_indices=[7]), "indices"),
+        (dict(token_indices=[1, 0]), "indices"),
+        (dict(token_indices=[]), "indices"),
+        (dict(token_indices=[9], value=1.0), "indices"),
+        (dict(value=float("nan")), "finite"),
+        (dict(value=float("inf")), "finite"),
+        (dict(value=True), "finite"),
+        (dict(value="-20"), "finite"),
+        (dict(heads=[2]), "heads must be"),
+        (dict(heads=[1, 0]), "heads must be"),
+        (dict(heads=[0, 0]), "heads must be"),
+        (dict(heads=[]), "heads must be"),
+        (dict(heads=(0,)), "heads must be"),
+        (dict(name="full"), "overwritten"),
+        (dict(name=""), "nonempty"),
+        (dict(source="nope"), "Unknown KV snapshot"),
+    ],
+)
+def test_bias_mask_rejects_bad_tokens_values_heads_and_names(kwargs, message):
+    store, layers, metadata = bias_store()
+    store.capture(
+        {"name": "full", "token_indices": list(range(6))}, "s", 0, metadata, 6
+    )
+    call = dict(name="m", source="full", token_indices=[1], value=-20.0, heads=None)
+    call.update(kwargs)
+    name, source = call.pop("name"), call.pop("source")
+    with pytest.raises(ValueError, match=message):
+        store.bias_mask(name, source, **call)
+    assert set(store.list()["snapshots"]) == {"full"}
+
+
+def test_bias_mask_is_refused_without_a_bias_buffer_or_recorded_tokens():
+    store, layers, metadata = fixture_store()  # FLASH_ATTN, no buffer
+    store.capture(
+        {"name": "full", "token_indices": list(range(6))}, "s", 0, metadata, 6
+    )
+    with pytest.raises(ValueError, match="cannot apply per-key bias"):
+        store.bias_mask("m", "full", token_indices=[1], value=-20.0)
+    store2, layers2, _ = bias_store()
+    store2.register(
+        "noidx",
+        {name: torch.zeros((2, 2, 6)) for name in layers2},
+        source_cursor=4,
+        source_position_offset=0,
+        retained_tokens=2,
+        method=method_record(),
+    )
+    with pytest.raises(ValueError, match="records no token indices"):
+        store2.bias_mask("m", "noidx", token_indices=[0], value=-20.0)

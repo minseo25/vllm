@@ -1356,6 +1356,24 @@ class Worker(WorkerBase):
             layer_token_indices=layer_token_indices,
         )
 
+    def cc_kv_bias_mask(
+        self,
+        name_out: str,
+        *,
+        source_snapshot: str,
+        token_indices: list[int],
+        value: float,
+        heads: list[int] | None = None,
+    ) -> dict:
+        """Copy a KV snapshot with its per-key bias set on the listed tokens."""
+        return self._cc_controller().kv_bias_mask(
+            name_out,
+            source_snapshot=source_snapshot,
+            token_indices=token_indices,
+            value=value,
+            heads=heads,
+        )
+
     def cc_kv_score(
         self,
         name_out: str,

@@ -1074,10 +1074,13 @@ class NativeCompactionController:
                 "kv_drop",
                 "q_drop",
                 "score_drop",
-                *(["bias"] if kv_bias else []),
+                *(["bias", "bias_mask"] if kv_bias else []),
             ],
             "kv_bias": kv_bias,
             "kv_bias_bytes": kv_store.bias_bytes() if kv_bias else 0,
+            # No environment switch: the buffer follows the resolved backend's
+            # supports_kv_bias() and an unquantized fp16/bf16/fp32 KV cache.
+            "kv_bias_policy": "resolved_backend_and_kv_dtype_only_no_env_flag",
             # Resolved attention backend of the FA layers (what kv_bias follows).
             "fa_backends": sorted(
                 {
@@ -2111,6 +2114,47 @@ class NativeCompactionController:
                 method=method,
                 token_indices=token_indices,
                 layer_token_indices=layer_token_indices,
+            )
+
+    def kv_bias_mask(
+        self,
+        name_out: str,
+        *,
+        source_snapshot: str,
+        token_indices: list[int],
+        value: float,
+        heads: list[int] | None = None,
+    ) -> dict:
+        """Copy a snapshot with its per-key bias set to ``value`` on ``token_indices``.
+
+        Kernel-level control for the bias path (harness): with ``value = -20``
+        on a token set ``D`` the import must generate like ``kv_subset`` of the
+        complement while differing from the full snapshot; ``heads`` (kv head
+        indices, default all) must differ from both. K/V rows, cursor, positions
+        and ``request_id`` are the source's; ``selection_policy`` is
+        ``bias_mask``. Refused unless every FA layer carries a paged bias buffer.
+        """
+        if not self.kv_store.bias_supported():
+            raise CompactionContractError(
+                f"kv_bias_mask refused: {KV_BIAS_UNSUPPORTED}"
+            )
+        if any(
+            not op.closed
+            and not op.failed
+            and op.capture_kv is not None
+            and op.capture_kv.get("name") == name_out
+            for op in self._all_operations()
+        ):
+            raise CompactionContractError(
+                "KV capture name is reserved by another operation"
+            )
+        with self._store_errors():
+            return self.kv_store.bias_mask(
+                name_out,
+                source_snapshot,
+                token_indices=token_indices,
+                value=value,
+                heads=heads,
             )
 
     def _kv_layer_source(

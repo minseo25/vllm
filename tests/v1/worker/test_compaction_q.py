@@ -2059,6 +2059,73 @@ def test_real_methods_library_bias_contract_on_tiny_tensors():
         assert torch.equal(layers[name].bias_cache[3, :, :3].T, beta[name])
 
 
+def test_kv_bias_mask_copies_a_snapshot_with_the_bias_set_on_listed_tokens(fakes):
+    """The harness control ``mask_D = kv_bias_mask(full, D, -20)``: a bias-only
+    copy of a snapshot, advertised as ``bias_mask`` only on a bias-capable
+    store, refused (before any store change) otherwise."""
+    controller, layers = resident_controller(bias=True)
+    assert "bias_mask" in controller.info()["store_ops"]
+    assert controller.info()["kv_bias_policy"].endswith("no_env_flag")
+    full = controller.kv_capture(
+        {"name": "full", "token_indices": list(range(CTX))}, "ctx", expected_cursor=CTX
+    )
+    receipt = controller.kv_bias_mask(
+        "mask", source_snapshot="full", token_indices=[2, 3], value=-20.0
+    )
+    assert receipt["selection_policy"] == "bias_mask" and receipt["synthetic"]
+    assert receipt["has_bias"] is True and receipt["digest"] == full["digest"]
+    assert receipt["derived_from"]["name"] == "full"
+    assert (receipt["source_cursor"], receipt["request_id"]) == (CTX, "ctx")
+    head0 = controller.kv_bias_mask(
+        "mask_h0", source_snapshot="full", token_indices=[2, 3], value=-20.0, heads=[0]
+    )
+    assert head0["method"]["params"]["heads"] == [0]
+    for name in FA:
+        beta = controller.kv_store.snapshot_bias("mask")[name]
+        assert beta.shape == (CTX, KV_HEADS)
+        assert torch.all(beta[[2, 3]] == -20.0) and not beta[[0, 1, 4, 5]].any()
+        beta_h0 = controller.kv_store.snapshot_bias("mask_h0")[name]
+        assert torch.all(beta_h0[[2, 3], 0] == -20.0) and not beta_h0[:, 1].any()
+        assert torch.equal(
+            controller.kv_store.snapshot_rows("mask")[name],
+            controller.kv_store.snapshot_rows("full")[name],
+        )
+    with pytest.raises(CompactionContractError, match="indices"):
+        controller.kv_bias_mask(
+            "bad", source_snapshot="full", token_indices=[CTX], value=-20.0
+        )
+    controller.kv_subset(
+        "part",
+        source_snapshot="full",
+        token_indices=[0, 1, 4, 5],
+        method={"name": "t", "params": {}, "inputs": {}},
+    )
+    with pytest.raises(CompactionContractError, match="not in the source snapshot"):
+        controller.kv_bias_mask(
+            "bad", source_snapshot="part", token_indices=[2], value=-20.0
+        )
+    with pytest.raises(CompactionContractError, match="finite"):
+        controller.kv_bias_mask(
+            "bad", source_snapshot="full", token_indices=[1], value=float("nan")
+        )
+    assert set(controller.kv_store.list()["snapshots"]) == {
+        "full",
+        "mask",
+        "mask_h0",
+        "part",
+    }
+    plain, _ = resident_controller()
+    assert "bias_mask" not in plain.info()["store_ops"]
+    plain.kv_capture(
+        {"name": "full", "token_indices": list(range(CTX))}, "ctx", expected_cursor=CTX
+    )
+    with pytest.raises(CompactionContractError, match="kv_bias_mask refused"):
+        plain.kv_bias_mask(
+            "mask", source_snapshot="full", token_indices=[2], value=-20.0
+        )
+    assert set(plain.kv_store.list()["snapshots"]) == {"full"}
+
+
 # ------------------------------------------------------------------ subset
 
 
