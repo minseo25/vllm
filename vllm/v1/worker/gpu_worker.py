@@ -1204,8 +1204,13 @@ class Worker(WorkerBase):
         capture_kv: dict | None = None,
         audit_restore: bool = False,
         prefill_boundary: int | None = None,
+        export_q: dict | None = None,
     ) -> dict:
-        """Arm one subsequent request for native-state capture and/or restore."""
+        """Arm one subsequent request for native-state capture and/or restore.
+
+        ``export_q = {"name", "token_range": [start, end]}`` additionally copies
+        the post-RoPE queries of that request's prefill rows in range to the host.
+        """
         return self._cc_controller().arm(
             capture_name,
             restore_name,
@@ -1219,6 +1224,7 @@ class Worker(WorkerBase):
             capture_kv,
             audit_restore,
             prefill_boundary,
+            export_q,
         )
 
     def cc_result(self) -> dict:
@@ -1303,6 +1309,96 @@ class Worker(WorkerBase):
     def cc_compare(self, name_a: str, name_b: str) -> dict:
         """Relative Frobenius differences between two immutable snapshots."""
         return self._cc_controller().compare(name_a, name_b)
+
+    def cc_q_exports(self) -> dict:
+        """Describe exported post-RoPE query ranges (host store, no tensors)."""
+        return self._cc_controller().q_exports()
+
+    def cc_q_drop(self, name: str) -> dict:
+        """Release a query export unused by active operations."""
+        return self._cc_controller().q_drop(name)
+
+    def cc_kv_capture(self, spec: dict, request_id: str) -> dict:
+        """Capture selected KV rows of a resident request outside a forward."""
+        return self._cc_controller().kv_capture(spec, request_id)
+
+    def cc_kv_score(
+        self,
+        name_out: str,
+        *,
+        q_export: str,
+        method: str,
+        request_id: str | None = None,
+        kv_snapshot: str | None = None,
+        params: dict | None = None,
+        key_range: list[int] | None = None,
+    ) -> dict:
+        """Score keys per (layer, kv_head, token) with 'h2o' or 'kvzip'."""
+        return self._cc_controller().kv_score(
+            name_out,
+            q_export=q_export,
+            method=method,
+            request_id=request_id,
+            kv_snapshot=kv_snapshot,
+            params=params,
+            key_range=key_range,
+        )
+
+    def cc_kv_select(
+        self,
+        name_out: str,
+        *,
+        scores: str,
+        budget_tokens: int,
+        protected: list[int] | None = None,
+        policy: str = "shared",
+        aggregate: str = "max",
+    ) -> dict:
+        """Select a uniform token budget per layer from stored scores."""
+        return self._cc_controller().kv_select(
+            name_out,
+            scores=scores,
+            budget_tokens=budget_tokens,
+            protected=protected,
+            policy=policy,
+            aggregate=aggregate,
+        )
+
+    def cc_kv_selections(self) -> dict:
+        """Describe stored selections."""
+        return self._cc_controller().kv_selections()
+
+    def cc_kv_fit_am(
+        self,
+        name_out: str,
+        *,
+        q_export: str,
+        budget_tokens: int,
+        request_id: str | None = None,
+        kv_snapshot: str | None = None,
+        protected: list[int] | None = None,
+        params: dict | None = None,
+        key_range: list[int] | None = None,
+    ) -> dict:
+        """Register an attention-matching synthetic snapshot (keys + fitted values)."""
+        return self._cc_controller().kv_fit_am(
+            name_out,
+            q_export=q_export,
+            budget_tokens=budget_tokens,
+            request_id=request_id,
+            kv_snapshot=kv_snapshot,
+            protected=protected,
+            params=params,
+            key_range=key_range,
+        )
+
+    def cc_scores(self) -> dict:
+        """Describe stored score tensors (float32 CPU) without returning them."""
+        return self._cc_controller().scores()
+
+    def cc_score_drop(self, name: str) -> dict:
+        """Release stored scores."""
+        return self._cc_controller().score_drop(name)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

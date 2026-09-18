@@ -7,7 +7,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -17,10 +19,38 @@ if TYPE_CHECKING:
 
 DESCRIPTOR_KEY = "native_compaction_v1"
 COMPONENTS = {"all": (0, 1), "conv": (0,), "matrix": (1,)}
+EXPORT_GRAPH_MODES = {"NONE", "PIECEWISE"}
 
 
 class CompactionContractError(ValueError):
     """The requested operation is outside the supported diagnostic contract."""
+
+
+def _q_module():
+    """Lazy import: compaction_q imports this module for the error type."""
+    from vllm.v1.worker import compaction_q
+
+    return compaction_q
+
+
+def validate_export_q(export_q: Any, start_cursor: int, prompt_tokens: int) -> dict:
+    """Normalize ``{"name", "token_range": [start, end]}`` inside the new tokens."""
+    if not isinstance(export_q, dict) or set(export_q) != {"name", "token_range"}:
+        raise CompactionContractError("export_q requires name and token_range")
+    name, token_range = export_q["name"], export_q["token_range"]
+    if not isinstance(name, str) or not name:
+        raise CompactionContractError("export_q name must be nonempty")
+    if (
+        not isinstance(token_range, (list, tuple))
+        or len(token_range) != 2
+        or any(type(x) is not int for x in token_range)
+        or not start_cursor <= token_range[0] < token_range[1] <= prompt_tokens
+    ):
+        raise CompactionContractError(
+            "export_q token_range must satisfy start_cursor <= start < end <= "
+            "expected_prompt_tokens"
+        )
+    return {"name": name, "token_range": [int(token_range[0]), int(token_range[1])]}
 
 
 def validate_configuration(config: Any) -> None:
@@ -558,6 +588,7 @@ class BoundaryOperation:
         capture_kv: dict | None = None,
         audit_restore: bool = False,
         prefill_boundary: int | None = None,
+        export_q: dict | None = None,
     ):
         if (
             isinstance(expected_prompt_tokens, bool)
@@ -614,6 +645,8 @@ class BoundaryOperation:
             raise CompactionContractError(
                 "prefill_boundary must be an integer inside the prompt"
             )
+        if export_q is not None:
+            export_q = validate_export_q(export_q, start_cursor, expected_prompt_tokens)
         if capture_name is not None and (
             not isinstance(capture_name, str)
             or not capture_name
@@ -636,6 +669,9 @@ class BoundaryOperation:
         self.capture_kv = copy.deepcopy(capture_kv)
         self.audit_restore = audit_restore
         self.prefill_boundary = prefill_boundary
+        self.export_q = export_q
+        self.q_export_chunks: list[dict] = []
+        self.q_export_receipt: dict | None = None
         self.kv_restore_receipt: dict | None = None
         self.kv_capture_receipt: dict | None = None
         self.request_id: str | None = None
@@ -836,6 +872,10 @@ class BoundaryOperation:
                 "capture": self.capture_receipt,
                 "restored_from": self.restore_name,
                 "snapshot": self.capture_receipt,
+                "export_q": self.export_q,
+                "query_exported": self.q_export_receipt is not None,
+                "q_export": self.q_export_receipt,
+                "q_export_chunks": self.q_export_chunks,
                 "returned_final_sample_is_not_consumed": True,
                 "scope": "native_per_request_boundary_intervention",
                 "total_cpu_snapshot_bytes": self.store.list()[
@@ -904,7 +944,13 @@ def _fa_metadata_on_cpu(metadata: dict, layer_names: set[str]) -> dict:
 class NativeCompactionController:
     """Default-off, per-request state/KV operations outside captured graphs."""
 
-    fresh_decode_rows_zeroed = 0  # class default: fixtures may bypass __init__
+    # Class defaults: fixtures may bypass __init__.
+    fresh_decode_rows_zeroed = 0
+    q_store: Any = None
+    score_store: Any = None
+    selection_store: Any = None
+    fa_layer_groups: dict[str, int] = {}
+    _export_plan: Any = None
 
     def __init__(self, runner: GPUModelRunner):
         validate_configuration(runner.vllm_config)
@@ -940,12 +986,23 @@ class NativeCompactionController:
             if not isinstance(group.kv_cache_spec, MambaSpec)
             for name in group.layer_names
         }
+        self.fa_layer_groups = {
+            name: group_id
+            for group_id, group in enumerate(runner.kv_cache_config.kv_cache_groups)
+            if not isinstance(group.kv_cache_spec, MambaSpec)
+            for name in group.layer_names
+        }
         if not self.layers or not self.fa_layers:
             raise CompactionContractError(
                 "Expected a hybrid with recurrent and FA layers"
             )
         self.store = SnapshotStore()
         self.kv_store = NativeKVSnapshotStore(runner)
+        compaction_q = _q_module()
+        self.q_store = compaction_q.QExportStore(list(self.kv_store.layers))
+        self.score_store = compaction_q.ScoreStore()
+        self.selection_store = compaction_q.SelectionStore()
+        self._export_plan = None
         self.operation: BoundaryOperation | None = None
         self.operations: dict[str, BoundaryOperation] = {}
         self._descriptors: dict[str, dict] = {}
@@ -978,6 +1035,9 @@ class NativeCompactionController:
             "batch_operations": True,
             "fresh_decode_rows_zeroed": self.fresh_decode_rows_zeroed,
             "fresh_decode_zeroing_scope": "every_request_row",
+            "query_export": self.q_store is not None,
+            "query_export_hook": "attention.compaction_q_export_prefill_only",
+            "compute_ops": ["kv_capture", "kv_score", "kv_select", "kv_fit_am"],
             "scope": "native_per_request_boundary_intervention",
         }
 
@@ -1061,6 +1121,7 @@ class NativeCompactionController:
         capture_kv: dict | None = None,
         audit_restore: bool = False,
         prefill_boundary: int | None = None,
+        export_q: dict | None = None,
     ) -> dict:
         if self.operation is not None and not self.operation.closed:
             raise CompactionContractError(
@@ -1082,8 +1143,10 @@ class NativeCompactionController:
             capture_kv=capture_kv,
             audit_restore=audit_restore,
             prefill_boundary=prefill_boundary,
+            export_q=export_q,
         )
         self._check_capture_names(operation)
+        self._open_export(operation, expected_request_id, None)
         self.operation = operation
         return {
             "armed": True,
@@ -1099,7 +1162,29 @@ class NativeCompactionController:
             "position_offset": position_offset,
             "audit_restore": audit_restore,
             "prefill_boundary": prefill_boundary,
+            "export_q": operation.export_q,
         }
+
+    def _q_store(self):
+        if self.q_store is None:
+            raise CompactionContractError("Query export store is unavailable")
+        return self.q_store
+
+    def _open_export(
+        self,
+        operation: BoundaryOperation,
+        request_id: str | None,
+        operation_id: str | None,
+    ) -> None:
+        """Reserve the export name when the operation is created."""
+        if operation.export_q is None:
+            return
+        self._q_store().open(
+            operation.export_q["name"],
+            token_range=operation.export_q["token_range"],
+            request_id=request_id,
+            operation_id=operation_id,
+        )
 
     def _bound_operation(
         self, request_id: str, request: Any
@@ -1161,6 +1246,7 @@ class NativeCompactionController:
             "capture_kv",
             "audit_restore",
             "prefill_boundary",
+            "export_q",
         }
         if set(descriptor) - fields:
             raise CompactionContractError("Unknown native_compaction_v1 fields")
@@ -1171,6 +1257,7 @@ class NativeCompactionController:
             self.store, expected_request_id=request_id, **kwargs
         )
         self._check_capture_names(operation)
+        self._open_export(operation, request_id, operation_id)
         self.operations[operation_id] = operation
         self._descriptors[operation_id] = copy.deepcopy(descriptor)
         self._seen_operation_ids.add(operation_id)
@@ -1348,6 +1435,7 @@ class NativeCompactionController:
             fa_cpu = None
             token_start = 0
             position_updates = []
+            export_items = []
             for row, request_id, operation in bound:
                 request = runner.requests[request_id]
                 count = int(scheduled_tokens[request_id])
@@ -1392,10 +1480,19 @@ class NativeCompactionController:
                     operation.validate_before(
                         request_id, request.num_prompt_tokens, computed, count, slots
                     )
+                    export_span = None
+                    if operation.export_q is not None:
+                        start, end = operation.export_q["token_range"]
+                        if computed < end and computed + count > start:
+                            export_span = (
+                                max(start, computed),
+                                min(end, computed + count),
+                            )
                     needs_fa = (
                         operation.request_id is None
                         or computed == operation.restore_at
                         or computed + count == operation.prompt_tokens
+                        or export_span is not None
                     )
                     context = None
                     if needs_fa:
@@ -1407,6 +1504,43 @@ class NativeCompactionController:
                             row=row,
                             query_tokens=count,
                             computed_tokens=computed,
+                        )
+                    if export_span is not None:
+                        # Ground the row slice in every FA layer's query_start_loc.
+                        for name in sorted(self.fa_layers):
+                            starts = getattr(fa_cpu.get(name), "query_start_loc", None)
+                            if (
+                                not isinstance(starts, torch.Tensor)
+                                or starts.numel() < row + 2
+                                or int(starts[row].item()) != token_start
+                            ):
+                                raise CompactionContractError(
+                                    "Query export requires FA query_start_loc matching "
+                                    f"the batch token start: {name}"
+                                )
+                        self._q_store().bind(operation.export_q["name"], request_id)
+                        cursor_start, cursor_end = export_span
+                        export_items.append(
+                            _q_module().ExportItem(
+                                name=operation.export_q["name"],
+                                operation=operation,
+                                row_start=token_start + cursor_start - computed,
+                                row_end=token_start + cursor_end - computed,
+                                cursor_start=cursor_start,
+                                cursor_end=cursor_end,
+                                positions=torch.arange(
+                                    cursor_start + offset,
+                                    cursor_end + offset,
+                                    dtype=torch.long,
+                                ),
+                                receipt={
+                                    "request_id": request_id,
+                                    "operation_id": operation.operation_id,
+                                    "batch_row": row,
+                                    "graph_mode": str(graph_mode),
+                                    "position_offset": offset,
+                                },
+                            )
                         )
                     if (
                         operation.kv_restore_name is not None
@@ -1518,15 +1652,61 @@ class NativeCompactionController:
                         op.restore_at,
                         op.position_offset,
                     )
+            if export_items and str(graph_mode) not in EXPORT_GRAPH_MODES:
+                raise CompactionContractError(
+                    "Query export requires an eager or piecewise forward; a FULL "
+                    f"CUDA-graph forward ({graph_mode}) cannot copy rows to the host"
+                )
             for start, count, offset in position_updates:
                 positions[..., start : start + count].add_(offset)
             self._forward_metadata = metadata
+            if export_items:
+                self._install_export(
+                    _q_module().QueryExportPlan(
+                        self._q_store(), self.fa_layers, export_items, total
+                    )
+                )
             return boundaries
         except Exception as error:
             self.fail_forward(error)
             raise
 
+    def _install_export(self, plan: Any) -> None:
+        """Point every FA layer's ``compaction_q_export`` at this forward's plan."""
+        layers = self.kv_store.layers
+        missing = [name for name in self.fa_layers if name not in layers]
+        if missing or self._export_plan is not None:
+            raise CompactionContractError(
+                f"Cannot install query export (missing layers {missing}, "
+                f"pending plan {self._export_plan is not None})"
+            )
+        for name in self.fa_layers:
+            layers[name].compaction_q_export = plan.hook
+        self._export_plan = plan
+
+    def _uninstall_export(self) -> None:
+        plan = self._export_plan
+        if plan is None:
+            return
+        for name in self.fa_layers:
+            layer = self.kv_store.layers.get(name)
+            if layer is not None:
+                layer.compaction_q_export = None
+        self._export_plan = None
+
     def after_forward(self, boundaries: list[ForwardBoundary] | None) -> None:
+        plan = self._export_plan
+        if plan is not None:
+            try:
+                receipts = plan.finish()
+            except Exception as error:
+                self.fail_forward(error)
+                raise
+            self._uninstall_export()
+            for item, receipt in zip(plan.items, receipts):
+                item.operation.q_export_chunks.append(receipt["chunks"][-1])
+                if receipt["complete"]:
+                    item.operation.q_export_receipt = receipt
         if boundaries is None:
             return
         try:
@@ -1555,6 +1735,536 @@ class NativeCompactionController:
             raise
 
     def fail_forward(self, error: Exception) -> None:
+        self._uninstall_export()
         for operation in self._all_operations():
             if not operation.closed:
                 operation.failed = f"{type(error).__name__}: {error}"
+
+    # ------------------------------------------------------------ query export
+    def q_exports(self) -> dict:
+        return self._q_store().list()
+
+    def q_drop(self, name: str) -> dict:
+        if any(
+            not op.closed and op.export_q is not None and op.export_q["name"] == name
+            for op in self._all_operations()
+        ):
+            raise CompactionContractError(
+                "Cannot drop an active operation's query export"
+            )
+        store = self._q_store()
+        store.drop(name)
+        return {"dropped": name, **store.list()}
+
+    # -------------------------------------------------------- resident access
+    def _resident(self, request_id: str) -> tuple[int, dict, int]:
+        """Row, FA block-table metadata and consumed cursor of a resident request."""
+        runner = self.runner
+        if runner.execute_model_state is not None:
+            raise CompactionContractError(
+                "Cannot read caches between forward and sampling"
+            )
+        if not isinstance(request_id, str) or not request_id:
+            raise CompactionContractError("request_id must be a nonempty string")
+        batch = runner.input_batch
+        if request_id not in runner.requests or request_id not in batch.req_id_to_index:
+            raise CompactionContractError(f"Request is not resident: {request_id}")
+        row = int(batch.req_id_to_index[request_id])
+        computed = int(batch.num_computed_tokens_cpu[row])
+        if computed != int(runner.requests[request_id].num_computed_tokens):
+            raise CompactionContractError(
+                "Worker request and scheduler cursors disagree"
+            )
+        if computed < 1:
+            raise CompactionContractError("Request has no consumed tokens")
+        metadata = {}
+        for name in self.fa_layers:
+            group = self.fa_layer_groups.get(name)
+            if group is None:
+                raise CompactionContractError(f"Unknown KV group for FA layer: {name}")
+            metadata[name] = SimpleNamespace(
+                block_table=batch.block_table[group].get_cpu_tensor()
+            )
+        return row, metadata, computed
+
+    def _position_offset(self, request_id: str, computed: int) -> int:
+        rule = self._position_rules.get(request_id, (0, 0))
+        return rule[1] if computed >= rule[0] else 0
+
+    def kv_capture(self, spec: dict, request_id: str) -> dict:
+        """Capture selected rows from a resident request's cache, outside a forward.
+
+        Same spec forms as ``capture_kv`` (shared or per-layer indices); the
+        source cursor is the request's consumed prefix and the recorded position
+        offset is the request's current rule, as an after-forward capture would
+        record.
+        """
+        name = spec.get("name") if isinstance(spec, dict) else None
+        if any(
+            not op.closed
+            and op.capture_kv is not None
+            and op.capture_kv.get("name") == name
+            for op in self._all_operations()
+        ):
+            raise CompactionContractError(
+                "KV capture name is reserved by another operation"
+            )
+        row, metadata, computed = self._resident(request_id)
+        return self.kv_store.capture(
+            spec,
+            request_id,
+            row,
+            metadata,
+            computed,
+            source_position_offset=self._position_offset(request_id, computed),
+        )
+
+    def _kv_layer_source(
+        self,
+        *,
+        request_id: str | None,
+        kv_snapshot: str | None,
+        key_range: Any,
+    ) -> tuple[dict, Any]:
+        """Describe a K/V source and return a per-layer row iterator.
+
+        The iterator yields ``(layer_name, rows[T, Hkv, 2D] on the cache device,
+        key_token_indices)``. Key token indices are request cursor positions,
+        which order the cache chronologically; they are what the causal mask uses.
+        """
+        if (request_id is None) == (kv_snapshot is None):
+            raise CompactionContractError(
+                "Give exactly one of request_id or kv_snapshot"
+            )
+        layers = self.kv_store.layers
+        if request_id is not None:
+            row, metadata, computed = self._resident(request_id)
+            if key_range is None:
+                start, end = 0, computed
+            else:
+                start, end = _q_module()._check_token_range(key_range, "key_range")
+            if end > computed:
+                raise CompactionContractError("key_range exceeds the consumed prefix")
+            indices = list(range(start, end))
+            source = {
+                "kind": "resident_request",
+                "request_id": request_id,
+                "cursor": computed,
+                "key_range": [start, end],
+                "position_offset": self._position_offset(request_id, computed),
+            }
+
+            def rows():
+                for name in layers:
+                    gathered = self.kv_store.read_rows(
+                        row, metadata, indices, computed_tokens=computed, layers=[name]
+                    )
+                    yield name, gathered[name], indices
+
+            return source, rows
+        if key_range is not None:
+            raise CompactionContractError("key_range applies to resident requests only")
+        entry = self.kv_store.describe(kv_snapshot)
+        if entry["layer_token_indices"] is None:
+            raise CompactionContractError("Snapshot records no token indices to score")
+        tensors = self.kv_store.snapshot_rows(kv_snapshot)
+        source = {
+            "kind": "kv_snapshot",
+            "name": kv_snapshot,
+            "digest": entry["digest"],
+            "cursor": entry["source_cursor"],
+            "synthetic": entry["synthetic"],
+            "position_offset": entry["source_position_offset"],
+        }
+
+        def snapshot_rows():
+            for name in layers:
+                yield (
+                    name,
+                    tensors[name].to(layers[name].kv_cache.device),
+                    list(entry["layer_token_indices"][name]),
+                )
+
+        return source, snapshot_rows
+
+    def _q_source(self, q_export: str) -> tuple[dict, dict, torch.Tensor]:
+        store = self._q_store()
+        entry = store.describe(q_export)
+        if not entry["complete"]:
+            raise CompactionContractError(f"Query export is incomplete: {q_export}")
+        if set(entry["layer_names"]) != set(self.kv_store.layers):
+            raise CompactionContractError("Query export layers differ from FA layers")
+        return entry, store.tensors(q_export), store.cursors(q_export)
+
+    @staticmethod
+    def _scale(layer: Any, params: dict) -> float:
+        """The softmax scale passed explicitly to the methods library.
+
+        Default ``head_size ** -0.5`` (the models' ``scaling``); the layer's own
+        kernel scale must agree unless the caller overrides with ``params['scale']``.
+        """
+        override = params.get("scale")
+        if override is not None:
+            if (
+                isinstance(override, bool)
+                or not isinstance(override, (int, float))
+                or override <= 0
+            ):
+                raise CompactionContractError(
+                    "params['scale'] must be a positive number"
+                )
+            return float(override)
+        head_size = getattr(layer, "head_size", None)
+        if type(head_size) is not int or head_size < 1:
+            raise CompactionContractError("Attention head_size unavailable for scaling")
+        scale = float(head_size) ** -0.5
+        kernel_scale = getattr(getattr(layer, "impl", None), "scale", None)
+        if kernel_scale is not None and abs(float(kernel_scale) - scale) > 1e-6 * scale:
+            raise CompactionContractError(
+                f"Layer kernel scale {kernel_scale} differs from head_size ** -0.5 "
+                f"({scale}); pass params['scale'] explicitly"
+            )
+        return scale
+
+    @staticmethod
+    def _protected_tokens(protected: Any) -> list[int]:
+        if protected is None:
+            return []
+        if (
+            not isinstance(protected, list)
+            or any(type(i) is not int or i < 0 for i in protected)
+            or protected != sorted(set(protected))
+        ):
+            raise CompactionContractError(
+                "protected must be unique, sorted, nonnegative token indices"
+            )
+        return list(protected)
+
+    # ------------------------------------------------------------ compute ops
+    def kv_score(
+        self,
+        name_out: str,
+        *,
+        q_export: str,
+        method: str,
+        request_id: str | None = None,
+        kv_snapshot: str | None = None,
+        params: dict | None = None,
+        key_range: Any = None,
+    ) -> dict:
+        """Score every key of the source per ``(layer, kv_head, token)``.
+
+        ``h2o``: accumulated causal attention mass of the exported queries over
+        the keys (positions = request token indices). ``kvzip``: reference-query
+        reconstruction attention (no causal mask). Scores are float32 CPU tensors
+        in ``ScoreStore[name_out]``.
+        """
+        compaction_q = _q_module()
+        if method not in compaction_q.SCORE_METHODS:
+            raise CompactionContractError(f"Unknown scoring method: {method}")
+        params = compaction_q._check_params(
+            params, {"chunk", "scale", "causal", "context_only_normalisation"}, "score"
+        )
+        if not isinstance(name_out, str) or not name_out:
+            raise CompactionContractError("Score names must be nonempty")
+        if name_out in self.score_store._entries:
+            raise CompactionContractError("Score names cannot be overwritten")
+        q_entry, q_tensors, q_cursors = self._q_source(q_export)
+        source, rows = self._kv_layer_source(
+            request_id=request_id, kv_snapshot=kv_snapshot, key_range=key_range
+        )
+        k_ref_reader = None
+        k_ref_info = None
+        if method == "kvzip" and not params.get("context_only_normalisation"):
+            # KVzip normalises over context keys plus the repeat input's own keys:
+            # read those keys from the exporting request's cache rows.
+            ref_request = q_entry["request_id"]
+            if ref_request is None:
+                raise CompactionContractError(
+                    "kvzip needs the query export's request for k_ref"
+                )
+            ref_row, ref_metadata, ref_computed = self._resident(ref_request)
+            ref_start, ref_end = q_entry["token_range"]
+            if ref_end > ref_computed:
+                raise CompactionContractError(
+                    "kvzip k_ref range exceeds the exporting request's consumed prefix"
+                )
+            ref_indices = list(range(ref_start, ref_end))
+
+            def k_ref_reader(name):
+                return self.kv_store.read_rows(
+                    ref_row,
+                    ref_metadata,
+                    ref_indices,
+                    computed_tokens=ref_computed,
+                    layers=[name],
+                )[name]
+
+            k_ref_info = {
+                "request_id": ref_request,
+                "token_range": [ref_start, ref_end],
+            }
+        started = time.perf_counter()
+        scores, key_indices, scales = {}, {}, {}
+        for name, kv_rows, indices in rows():
+            layer = self.kv_store.layers[name]
+            keys, _ = compaction_q.split_kv(kv_rows, layer.head_size)
+            k_ref = None
+            if k_ref_reader is not None:
+                k_ref, _ = compaction_q.split_kv(k_ref_reader(name), layer.head_size)
+            scales[name] = self._scale(layer, params)
+            scores[name] = compaction_q.score_layer(
+                method,
+                q=q_tensors[name].to(keys.device),
+                k=keys,
+                scale=scales[name],
+                q_positions=q_cursors,
+                k_positions=torch.tensor(indices, dtype=torch.long),
+                params=params,
+                k_ref=k_ref,
+            )
+            key_indices[name] = list(indices)
+        receipt = self.score_store.put(
+            name_out,
+            layers=scores,
+            key_token_indices=key_indices,
+            method=method,
+            params={**params, "chunk": params.get("chunk", compaction_q.DEFAULT_CHUNK)},
+            q_export=q_export,
+            source={
+                **source,
+                "q_token_range": q_entry["token_range"],
+                "q_rows": q_entry["rows"],
+                "query_convention": q_entry["query_convention"],
+                "scale": scales,
+                "k_ref": k_ref_info,
+                "normalisation": (
+                    "context_plus_causal_repeat_keys"
+                    if k_ref_info is not None
+                    else "context_only"
+                )
+                if method == "kvzip"
+                else "causal_over_scored_keys",
+            },
+        )
+        receipt["seconds"] = time.perf_counter() - started
+        return receipt
+
+    def kv_select(
+        self,
+        name_out: str,
+        *,
+        scores: str,
+        budget_tokens: int,
+        protected: list[int] | None = None,
+        policy: str = "shared",
+        aggregate: str = "max",
+    ) -> dict:
+        """Uniform token budget per layer from stored scores.
+
+        Returns (and stores under ``name_out``) ``layer_token_indices`` (request
+        token indices per layer, equal counts) plus ``token_indices`` for the
+        shared policy, and a ready ``capture_spec`` for ``capture_kv``/``kv_capture``.
+        ``protected`` are token indices that must be kept.
+        """
+        compaction_q = _q_module()
+        if not isinstance(name_out, str) or not name_out:
+            raise CompactionContractError("Selection names must be nonempty")
+        if name_out in self.selection_store._entries:
+            raise CompactionContractError("Selection names cannot be overwritten")
+        tensors = self.score_store.tensors(scores)
+        key_indices = self.score_store.key_token_indices(scores)
+        order = [name for name in self.kv_store.layers if name in tensors]
+        if set(order) != set(tensors):
+            raise CompactionContractError("Scores name layers outside the FA set")
+        if len({tuple(v) for v in key_indices.values()}) != 1:
+            raise CompactionContractError(
+                "Selection requires every layer to score the same key tokens"
+            )
+        tokens = key_indices[order[0]]
+        position_of = {token: position for position, token in enumerate(tokens)}
+        protected_tokens = self._protected_tokens(protected)
+        missing = [t for t in protected_tokens if t not in position_of]
+        if missing:
+            raise CompactionContractError(
+                f"protected tokens are not among the scored keys: {missing}"
+            )
+        started = time.perf_counter()
+        selections = compaction_q.select_layers(
+            [tensors[name] for name in order],
+            budget_tokens=budget_tokens,
+            protected=[position_of[t] for t in protected_tokens],
+            policy=policy,
+            aggregate=aggregate,
+        )
+        layer_tokens = {
+            name: [tokens[p] for p in chosen] for name, chosen in zip(order, selections)
+        }
+        shared = policy == "shared"
+        result = {
+            "name": name_out,
+            "scores": scores,
+            "method": self.score_store.describe(scores)["method"],
+            "policy": policy,
+            "aggregate": aggregate,
+            "budget_tokens": budget_tokens,
+            "protected": protected_tokens,
+            "retained_tokens": len(selections[0]),
+            "scored_tokens": len(tokens),
+            "layer_order": order,
+            "layer_token_indices": layer_tokens,
+            "token_indices": layer_tokens[order[0]] if shared else None,
+            "capture_spec": (
+                {"name": name_out, "token_indices": layer_tokens[order[0]]}
+                if shared
+                else {"name": name_out, "layer_token_indices": layer_tokens}
+            ),
+            "seconds": time.perf_counter() - started,
+        }
+        return self.selection_store.put(name_out, result)
+
+    def kv_selections(self) -> dict:
+        return self.selection_store.list()
+
+    def kv_fit_am(
+        self,
+        name_out: str,
+        *,
+        q_export: str,
+        budget_tokens: int,
+        request_id: str | None = None,
+        kv_snapshot: str | None = None,
+        protected: list[int] | None = None,
+        params: dict | None = None,
+        key_range: Any = None,
+    ) -> dict:
+        """Attention matching, M1 form: selected original keys + OLS-fitted values.
+
+        Per FA layer ``am.compact(q_ref, k, v, budget, bias=False,
+        head_budget='uniform', protected=...)`` returns key positions and fitted
+        values; the rows ``[k[indices] | values]`` are registered as a synthetic
+        snapshot ``name_out`` (``method.name = 'am_nobias_uniform'``). Values are
+        cast to the cache dtype; the cast is recorded in ``method.params``.
+        """
+        compaction_q = _q_module()
+        params = compaction_q._check_params(
+            params,
+            {"ridge", "chunk", "scale", "digest_inputs", "refit_protected"},
+            "am",
+        )
+        if type(budget_tokens) is not int or budget_tokens < 1:
+            raise CompactionContractError("budget_tokens must be a positive integer")
+        if not isinstance(name_out, str) or not name_out:
+            raise CompactionContractError("KV snapshot name must be nonempty")
+        if name_out in self.kv_store._entries:
+            raise CompactionContractError("KV snapshot names cannot be overwritten")
+        refit_protected = params.get("refit_protected", False)
+        if not isinstance(refit_protected, bool):
+            raise CompactionContractError("refit_protected must be a bool")
+        protected_tokens = self._protected_tokens(protected)
+        q_entry, q_tensors, _ = self._q_source(q_export)
+        source, rows = self._kv_layer_source(
+            request_id=request_id, kv_snapshot=kv_snapshot, key_range=key_range
+        )
+        started = time.perf_counter()
+        synthetic, layer_tokens, kv_digests = {}, {}, {}
+        casts, variants, diagnostics, scales = set(), set(), {}, {}
+        for name, kv_rows, indices in rows():
+            layer = self.kv_store.layers[name]
+            keys, values = compaction_q.split_kv(kv_rows, layer.head_size)
+            position_of = {token: position for position, token in enumerate(indices)}
+            missing = [t for t in protected_tokens if t not in position_of]
+            if missing:
+                raise CompactionContractError(
+                    f"protected tokens are not among the source keys: {missing}"
+                )
+            scales[name] = self._scale(layer, params)
+            protected_positions = [position_of[t] for t in protected_tokens]
+            fit = compaction_q.fit_am_layer(
+                q_ref=q_tensors[name].to(keys.device),
+                k=keys,
+                v=values,
+                budget=budget_tokens,
+                protected=protected_positions,
+                scale=scales[name],
+                params=params,
+            )
+            casts.add(f"{fit['v_c'].dtype}->{values.dtype}")
+            variants.add(fit["variant"])
+            diagnostics[name] = fit["diagnostics"]
+            fitted = fit["v_c"].to(device=keys.device, dtype=values.dtype)
+            if protected_positions and not refit_protected:
+                # Frame tokens are protected and never refit: keep their values.
+                kept = torch.tensor(
+                    [
+                        i
+                        for i, p in enumerate(fit["indices"])
+                        if p in protected_positions
+                    ],
+                    dtype=torch.long,
+                    device=keys.device,
+                )
+                original = torch.tensor(
+                    [p for p in fit["indices"] if p in protected_positions],
+                    dtype=torch.long,
+                    device=keys.device,
+                )
+                fitted = fitted.clone()
+                fitted[kept] = values[original]
+            synthetic[name] = torch.cat(
+                [fit["k_c"].to(device=keys.device, dtype=keys.dtype), fitted], dim=-1
+            ).cpu()
+            layer_tokens[name] = [indices[p] for p in fit["indices"]]
+            if params.get("digest_inputs"):
+                kv_digests[name] = compaction_q._digest_tensors({name: kv_rows})
+        retained = {len(v) for v in layer_tokens.values()}
+        if len(retained) != 1 or len(variants) != 1:
+            raise CompactionContractError("AM layers disagree on count or variant")
+        method = {
+            "name": variants.pop(),
+            "alias": "am_nobias_uniform",
+            "params": {
+                **params,
+                "chunk": params.get("chunk", compaction_q.DEFAULT_CHUNK),
+                "ridge": params.get("ridge", 0.0),
+                "scale": scales,
+                "budget_tokens": budget_tokens,
+                "protected": protected_tokens,
+                "bias": False,
+                "head_budget": "uniform",
+                "protected_values": "fitted" if refit_protected else "original",
+                "values_cast": sorted(casts),
+            },
+            "inputs": {
+                "q_export": q_export,
+                "q_token_range": q_entry["token_range"],
+                "q_digest": compaction_q._digest_tensors(q_tensors),
+                "query_convention": q_entry["query_convention"],
+                "source": source,
+                "kv_digests": kv_digests if params.get("digest_inputs") else None,
+            },
+            "diagnostics": diagnostics,
+        }
+        receipt = self.kv_store.register(
+            name_out,
+            synthetic,
+            source_cursor=int(source["cursor"]),
+            source_position_offset=int(source["position_offset"]),
+            retained_tokens=retained.pop(),
+            method=method,
+            layer_token_indices=layer_tokens,
+            request_id=source.get("request_id"),
+        )
+        receipt["seconds"] = time.perf_counter() - started
+        return receipt
+
+    def scores(self) -> dict:
+        if self.score_store is None:
+            raise CompactionContractError("Score store is unavailable")
+        return self.score_store.list()
+
+    def score_drop(self, name: str) -> dict:
+        if self.score_store is None:
+            raise CompactionContractError("Score store is unavailable")
+        self.score_store.drop(name)
+        return {"dropped": name, **self.score_store.list()}

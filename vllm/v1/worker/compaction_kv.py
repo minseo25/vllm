@@ -5,6 +5,19 @@
 The scheduler still owns every cache page. Import replaces an already computed
 scratch prefix, at its exact boundary, before the next token is consumed. It
 does not reconstruct KV from a recurrent state or merely mask a full cache.
+
+Snapshot entries come from two sources and import through one ``restore`` path:
+
+* ``capture``: rows copied from the paged cache of a live request, selected by
+  one shared token list (``{"name", "token_indices"}``) or by one list per
+  full-attention layer (``{"name", "layer_token_indices"}``, equal counts).
+* ``register``: rows computed outside the cache (for example attention-matching
+  values), validated against each layer's cache layout exactly as a capture of
+  ``retained_tokens`` rows would be. Such entries carry ``synthetic: True`` and a
+  ``method`` record (name, params, input digests).
+
+Row layout per layer is the cache's ``[tokens, num_kv_heads, 2 * head_size]``
+with keys in ``[..., :head_size]`` and values in ``[..., head_size:]``.
 """
 
 from __future__ import annotations
@@ -16,6 +29,9 @@ from typing import Any
 
 import torch
 
+SUPPORTED_BACKENDS = {"FLASH_ATTN", "TRITON_ATTN"}
+SUPPORTED_CACHE_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+
 
 def _digest(tensors: dict[str, torch.Tensor]) -> str:
     result = hashlib.sha256()
@@ -25,6 +41,26 @@ def _digest(tensors: dict[str, torch.Tensor]) -> str:
         )
         result.update(tensor.cpu().contiguous().view(torch.uint8).numpy().tobytes())
     return result.hexdigest()
+
+
+def _validate_index_list(indices: Any, computed_tokens: int | None) -> list[int]:
+    """Unique, chronological, nonnegative ints below the consumed cursor."""
+    limit = computed_tokens if computed_tokens is not None else float("inf")
+    if (
+        not isinstance(indices, list)
+        or not indices
+        or any(type(i) is not int or not 0 <= i < limit for i in indices)
+        or indices != sorted(set(indices))
+    ):
+        raise ValueError("KV indices must be unique, chronological, and consumed")
+    return list(indices)
+
+
+def split_kv(rows: torch.Tensor, head_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split ``[tokens, num_kv_heads, 2 * head_size]`` rows into (keys, values)."""
+    if rows.ndim != 3 or rows.shape[-1] != 2 * head_size:
+        raise ValueError("KV rows must be [tokens, kv_heads, 2 * head_size]")
+    return rows[..., :head_size], rows[..., head_size:]
 
 
 class NativeKVSnapshotStore:
@@ -43,45 +79,90 @@ class NativeKVSnapshotStore:
         self._entries: dict[str, dict] = {}
         self._staged: dict[str, dict[str, torch.Tensor]] = {}
 
+    # ------------------------------------------------------------------ specs
+    def _layer_indices(
+        self, spec: dict, computed_tokens: int
+    ) -> tuple[str, dict[str, list[int]]]:
+        """Resolve a capture spec into per-layer index lists and its policy."""
+        if not isinstance(spec, dict) or "name" not in spec:
+            raise ValueError("KV capture requires name and token_indices")
+        if not isinstance(spec["name"], str) or not spec["name"]:
+            raise ValueError("KV snapshot name must be nonempty")
+        keys = set(spec)
+        if keys == {"name", "token_indices"}:
+            indices = _validate_index_list(spec["token_indices"], computed_tokens)
+            return "shared", {name: list(indices) for name in self.layers}
+        if keys == {"name", "layer_token_indices"}:
+            per_layer = spec["layer_token_indices"]
+            if not isinstance(per_layer, dict) or set(per_layer) != set(self.layers):
+                raise ValueError(
+                    "layer_token_indices must name every FA layer exactly once"
+                )
+            validated = {
+                name: _validate_index_list(per_layer[name], computed_tokens)
+                for name in self.layers
+            }
+            if len({len(v) for v in validated.values()}) != 1:
+                raise ValueError(
+                    "layer_token_indices must have equal counts across layers"
+                )
+            return "per_layer", validated
+        raise ValueError(
+            "KV capture requires name and token_indices or layer_token_indices"
+        )
+
     @staticmethod
     def _indices(spec: dict, computed_tokens: int) -> list[int]:
+        """Legacy shared-selection validation (kept for callers and tests)."""
         if not isinstance(spec, dict) or set(spec) != {"name", "token_indices"}:
             raise ValueError("KV capture requires name and token_indices")
         if not isinstance(spec["name"], str) or not spec["name"]:
             raise ValueError("KV snapshot name must be nonempty")
-        indices = spec["token_indices"]
+        return _validate_index_list(spec["token_indices"], computed_tokens)
+
+    def _check_layout(self, name: str, layer: Any) -> torch.Tensor:
+        cache = layer.kv_cache
         if (
-            not isinstance(indices, list)
-            or not indices
-            or any(type(i) is not int or not 0 <= i < computed_tokens for i in indices)
-            or indices != sorted(set(indices))
+            layer.get_attn_backend().get_name() not in SUPPORTED_BACKENDS
+            or not isinstance(cache, torch.Tensor)
+            or cache.ndim != 4
+            or cache.dtype not in SUPPORTED_CACHE_DTYPES
+            or cache.shape[3] != 2 * layer.head_size
+            or cache.shape[1] != layer.num_kv_heads
         ):
-            raise ValueError("KV indices must be unique, chronological, and consumed")
-        return indices
+            raise ValueError(f"Unsupported exact-KV cache layout: {name}")
+        return cache
 
     def _locations(
-        self, row: int, metadata: dict, indices: list[int]
+        self,
+        row: int,
+        metadata: dict,
+        indices: list[int] | dict[str, list[int]],
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Validate every layer before a caller can mutate any layer."""
+        """Validate every layer before a caller can mutate any layer.
+
+        ``indices`` is one shared list or one list per FA layer.
+        """
         if type(row) is not int or row < 0 or not self.layers:
             raise ValueError("KV import requires a real request row and FA layers")
+        per_layer = (
+            indices
+            if isinstance(indices, dict)
+            else {name: indices for name in self.layers}
+        )
+        if set(per_layer) != set(self.layers):
+            raise ValueError("KV selection must cover exactly the FA layers")
         locations = {}
         for name, layer in self.layers.items():
-            cache = layer.kv_cache
-            if (
-                layer.get_attn_backend().get_name() not in {"FLASH_ATTN", "TRITON_ATTN"}
-                or not isinstance(cache, torch.Tensor)
-                or cache.ndim != 4
-                or cache.dtype not in {torch.float16, torch.bfloat16, torch.float32}
-                or cache.shape[3] != 2 * layer.head_size
-                or cache.shape[1] != layer.num_kv_heads
-            ):
-                raise ValueError(f"Unsupported exact-KV cache layout: {name}")
+            cache = self._check_layout(name, layer)
+            selected = per_layer[name]
+            if not selected:
+                raise ValueError(f"Empty KV selection: {name}")
             table = getattr(metadata.get(name), "block_table", None)
             if not isinstance(table, torch.Tensor) or table.ndim != 2:
                 raise ValueError(f"Missing kernel block table: {name}")
             block_size = cache.shape[2]
-            logical = torch.tensor(indices, dtype=torch.long)
+            logical = torch.tensor(selected, dtype=torch.long)
             block_columns = logical // block_size
             if row >= table.shape[0] or int(block_columns.max()) >= table.shape[1]:
                 raise ValueError(f"KV selection exceeds allocated block table: {name}")
@@ -91,7 +172,7 @@ class NativeKVSnapshotStore:
             if bool(((physical <= 0) | (physical >= cache.shape[0])).any()):
                 raise ValueError(f"KV selection points to NULL/invalid pages: {name}")
             addresses = physical * block_size + offsets
-            if addresses.unique().numel() != len(indices):
+            if addresses.unique().numel() != len(selected):
                 raise ValueError(f"Aliased KV destination addresses: {name}")
             locations[name] = (
                 cache,
@@ -100,6 +181,7 @@ class NativeKVSnapshotStore:
             )
         return locations
 
+    # --------------------------------------------------------------- capture
     def validate_capture(
         self,
         spec: dict,
@@ -108,10 +190,10 @@ class NativeKVSnapshotStore:
         metadata: dict,
         computed_tokens: int,
     ) -> None:
-        indices = self._indices(spec, computed_tokens)
+        _, per_layer = self._layer_indices(spec, computed_tokens)
         if spec["name"] in self._entries:
             raise ValueError("KV snapshot names cannot be overwritten")
-        self._locations(row, metadata, indices)
+        self._locations(row, metadata, per_layer)
 
     def capture(
         self,
@@ -125,37 +207,208 @@ class NativeKVSnapshotStore:
         if type(source_position_offset) is not int or source_position_offset < 0:
             raise ValueError("Invalid source position offset")
         self.validate_capture(spec, request_id, row, metadata, computed_tokens)
-        locations = self._locations(row, metadata, spec["token_indices"])
+        policy, per_layer = self._layer_indices(spec, computed_tokens)
+        locations = self._locations(row, metadata, per_layer)
         tensors = {
             name: cache[blocks, :, offsets, :].detach().cpu().clone()
             for name, (cache, blocks, offsets) in locations.items()
         }
         if not all(bool(torch.isfinite(t).all()) for t in tensors.values()):
             raise ValueError("Non-finite selected KV values")
-        entry = {
+        first = next(iter(per_layer.values()))
+        self._entries[spec["name"]] = {
             "name": spec["name"],
             "request_id": request_id,
             "source_cursor": computed_tokens,
             "source_position_offset": source_position_offset,
             "source_absolute_next_position": computed_tokens + source_position_offset,
-            "token_indices": list(spec["token_indices"]),
-            "retained_tokens": len(spec["token_indices"]),
+            "selection_policy": policy,
+            "token_indices": list(first) if policy == "shared" else None,
+            "layer_token_indices": {name: list(v) for name, v in per_layer.items()},
+            "retained_tokens": len(first),
+            "synthetic": False,
+            "method": None,
             "bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
             "digest": _digest(tensors),
             "digest_verified_at": "capture",
             "tensors": tensors,
         }
-        self._entries[spec["name"]] = entry
         return self.describe(spec["name"])
 
+    # -------------------------------------------------------------- register
+    def register(
+        self,
+        name: str,
+        tensors: dict[str, torch.Tensor],
+        *,
+        source_cursor: int,
+        source_position_offset: int,
+        retained_tokens: int,
+        method: dict,
+        layer_token_indices: dict[str, list[int]] | None = None,
+        token_indices: list[int] | None = None,
+        request_id: str | None = None,
+    ) -> dict:
+        """Store rows computed outside the cache as an importable snapshot.
+
+        Every layer tensor must look exactly like a capture of ``retained_tokens``
+        rows from that layer's cache: shape ``[retained_tokens, num_kv_heads,
+        2 * head_size]``, the cache dtype, all values finite. ``method`` records
+        how the rows were produced (``name``, ``params``, ``inputs`` digests) and
+        must be JSON-serializable. Optional ``layer_token_indices`` or
+        ``token_indices`` record which source tokens the rows stand for.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("KV snapshot name must be nonempty")
+        if name in self._entries:
+            raise ValueError("KV snapshot names cannot be overwritten")
+        for value, label in (
+            (source_cursor, "source_cursor"),
+            (source_position_offset, "source_position_offset"),
+            (retained_tokens, "retained_tokens"),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{label} must be a nonnegative integer")
+        if retained_tokens < 1 or retained_tokens > source_cursor:
+            raise ValueError("retained_tokens must lie in 1..source_cursor")
+        if request_id is not None and (
+            not isinstance(request_id, str) or not request_id
+        ):
+            raise ValueError("request_id must be a nonempty string or None")
+        if not self.layers:
+            raise ValueError("KV register requires FA layers")
+        if not isinstance(tensors, dict) or set(tensors) != set(self.layers):
+            raise ValueError("Synthetic KV must provide exactly the FA layers")
+        if (
+            not isinstance(method, dict)
+            or not isinstance(method.get("name"), str)
+            or not method["name"]
+            or not isinstance(method.get("params"), dict)
+            or not isinstance(method.get("inputs"), dict)
+        ):
+            raise ValueError("method must carry name, params and inputs")
+        try:
+            json.dumps(method)
+        except (TypeError, ValueError) as error:
+            raise ValueError("method must be JSON-serializable") from error
+        if layer_token_indices is not None and token_indices is not None:
+            raise ValueError("Give layer_token_indices or token_indices, not both")
+        policy = None
+        per_layer = None
+        if layer_token_indices is not None:
+            policy, per_layer = self._layer_indices(
+                {"name": name, "layer_token_indices": layer_token_indices},
+                source_cursor,
+            )
+        elif token_indices is not None:
+            policy, per_layer = self._layer_indices(
+                {"name": name, "token_indices": token_indices}, source_cursor
+            )
+        if per_layer is not None and any(
+            len(v) != retained_tokens for v in per_layer.values()
+        ):
+            raise ValueError("Recorded token indices must count retained_tokens")
+        copied = {}
+        for layer_name, layer in self.layers.items():
+            cache = self._check_layout(layer_name, layer)
+            tensor = tensors[layer_name]
+            if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != (
+                retained_tokens,
+                cache.shape[1],
+                cache.shape[3],
+            ):
+                raise ValueError(
+                    f"Synthetic KV shape differs from the cache layout: {layer_name}"
+                )
+            if tensor.dtype != cache.dtype:
+                raise ValueError(
+                    f"Synthetic KV dtype differs from the cache: {layer_name}"
+                )
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(f"Non-finite synthetic KV values: {layer_name}")
+            copied[layer_name] = tensor.detach().to("cpu", copy=True).contiguous()
+        self._entries[name] = {
+            "name": name,
+            "request_id": request_id,
+            "source_cursor": source_cursor,
+            "source_position_offset": source_position_offset,
+            "source_absolute_next_position": source_cursor + source_position_offset,
+            "selection_policy": policy,
+            "token_indices": (
+                list(next(iter(per_layer.values())))
+                if policy == "shared" and per_layer
+                else None
+            ),
+            "layer_token_indices": (
+                {k: list(v) for k, v in per_layer.items()} if per_layer else None
+            ),
+            "retained_tokens": retained_tokens,
+            "synthetic": True,
+            "method": copy.deepcopy(method),
+            "bytes": sum(t.numel() * t.element_size() for t in copied.values()),
+            "digest": _digest(copied),
+            "digest_verified_at": "register",
+            "tensors": copied,
+        }
+        return self.describe(name)
+
+    # -------------------------------------------------------------- reading
+    def read_rows(
+        self,
+        row: int,
+        metadata: dict,
+        indices: list[int] | dict[str, list[int]],
+        *,
+        computed_tokens: int | None = None,
+        layers: list[str] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Gather selected cache rows per layer on the cache device (no host copy).
+
+        Returns ``{layer: Tensor[len(indices), num_kv_heads, 2 * head_size]}``
+        for ``layers`` (default: every FA layer); every layer is validated even
+        when only a subset is gathered. ``computed_tokens`` bounds the indices to
+        the consumed prefix; without it only structural validation applies.
+        """
+        per_layer = (
+            {
+                name: _validate_index_list(indices[name], computed_tokens)
+                for name in indices
+            }
+            if isinstance(indices, dict)
+            else _validate_index_list(indices, computed_tokens)
+        )
+        locations = self._locations(row, metadata, per_layer)
+        selected = list(self.layers) if layers is None else list(layers)
+        if set(selected) - set(self.layers) or len(set(selected)) != len(selected):
+            raise ValueError("read_rows layers must be distinct FA layers")
+        return {
+            name: locations[name][0][locations[name][1], :, locations[name][2], :]
+            for name in selected
+        }
+
+    def snapshot_rows(self, name: str) -> dict[str, torch.Tensor]:
+        """The immutable CPU rows of a snapshot (callers must not mutate them)."""
+        self.describe(name)
+        return dict(self._entries[name]["tensors"])
+
+    # ------------------------------------------------------------- metadata
     def describe(self, name: str) -> dict:
         if name not in self._entries:
             raise ValueError(f"Unknown KV snapshot: {name}")
-        result = {
-            key: copy.deepcopy(value)
-            for key, value in self._entries[name].items()
-            if key != "tensors"
-        }
+        result = {}
+        for key, value in self._entries[name].items():
+            if key == "tensors":
+                continue
+            if key == "token_indices":
+                result[key] = list(value) if value is not None else None
+            elif key == "layer_token_indices":
+                result[key] = (
+                    {k: list(v) for k, v in value.items()}
+                    if value is not None
+                    else None
+                )
+            else:
+                result[key] = copy.deepcopy(value)
         result["staged_gpu_bytes"] = sum(
             t.numel() * t.element_size()
             for t in self._staged.get(name, {}).values()
@@ -197,6 +450,7 @@ class NativeKVSnapshotStore:
             raise ValueError("An immutable KV snapshot was modified")
         return {**self.describe(name), "audited": True, "staged_digest": gpu_digest}
 
+    # --------------------------------------------------------------- restore
     def validate_restore(
         self,
         name: str,
@@ -243,15 +497,18 @@ class NativeKVSnapshotStore:
             page_bytes += (
                 blocks.unique().numel() * cache[0].numel() * cache.element_size()
             )
+        entry = self._entries[name]
         return {
             "name": name,
             "request_id": request_id,
             "cursor": computed_tokens,
-            "source_cursor": self._entries[name]["source_cursor"],
+            "source_cursor": entry["source_cursor"],
             "retained_tokens": computed_tokens,
-            "payload_bytes": self._entries[name]["bytes"],
+            "payload_bytes": entry["bytes"],
             "occupied_kernel_page_bytes": page_bytes,
-            "source_digest": self._entries[name]["digest"],
+            "source_digest": entry["digest"],
+            "selection_policy": entry["selection_policy"],
+            "synthetic": entry["synthetic"],
             "copy_kind": "exact_indexed_assignment",
             "scratch_prefill_tokens": computed_tokens,
         }

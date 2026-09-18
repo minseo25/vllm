@@ -445,6 +445,11 @@ class Attention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.attn_type = attn_type
+        # Native compaction query export (vllm.v1.worker.compaction_q). The
+        # controller sets this to a per-forward hook for eager/piecewise prefill
+        # forwards of a flagged request and resets it afterwards; it stays None
+        # for dummy runs, CUDA-graph capture and decode steps.
+        self.compaction_q_export = None
 
         if kv_sharing_target_layer_name is not None:
             validate_kv_sharing_target(
@@ -832,6 +837,13 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+
+    # Native compaction query export: a read-only host copy of post-RoPE query
+    # rows, installed only for eager/piecewise prefill forwards of a flagged
+    # request (see vllm.v1.worker.compaction_q). None otherwise.
+    query_export = getattr(self, "compaction_q_export", None)
+    if query_export is not None:
+        query_export(self, query, attn_metadata)
 
     self.impl.forward(
         self,
