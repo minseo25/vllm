@@ -2387,6 +2387,34 @@ class NativeCompactionController:
     def kv_selections(self) -> dict:
         return self.selection_store.list()
 
+    def kv_selection_drop(self, name: str) -> dict:
+        """Release a selection so a retried task may reuse its name.
+
+        Refused only while a live (not closed, not failed) operation reserves a
+        KV capture of that name, i.e. a boundary capture of the selection's
+        ``capture_spec`` is still pending.
+        """
+        if any(
+            not op.closed
+            and not op.failed
+            and op.capture_kv is not None
+            and op.capture_kv.get("name") == name
+            for op in self._all_operations()
+        ):
+            raise CompactionContractError(
+                "Cannot drop a selection whose capture is reserved by an operation"
+            )
+        self.selection_store.drop(name)
+        return {"dropped": name, **self.selection_store.list()}
+
+    def kv_describe(self, name: str) -> dict:
+        """One KV snapshot's metadata (no tensors), without listing the store."""
+        return self.kv_store.describe(name)
+
+    def q_describe(self, name: str) -> dict:
+        """One query export's metadata (no tensors), without listing the store."""
+        return self._q_store().describe(name)
+
     def kv_fit_am(
         self,
         name_out: str,

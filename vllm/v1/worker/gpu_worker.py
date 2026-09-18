@@ -1405,6 +1405,18 @@ class Worker(WorkerBase):
         """Describe stored selections."""
         return self._cc_controller().kv_selections()
 
+    def cc_kv_selection_drop(self, name: str) -> dict:
+        """Release a stored selection (its name becomes reusable)."""
+        return self._cc_controller().kv_selection_drop(name)
+
+    def cc_kv_describe(self, name: str) -> dict:
+        """Describe one KV snapshot by name."""
+        return self._cc_controller().kv_describe(name)
+
+    def cc_q_describe(self, name: str) -> dict:
+        """Describe one query export by name."""
+        return self._cc_controller().q_describe(name)
+
     def cc_kv_fit_am(
         self,
         name_out: str,

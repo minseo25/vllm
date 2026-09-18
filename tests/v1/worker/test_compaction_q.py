@@ -1879,3 +1879,58 @@ def test_subset_of_a_synthetic_snapshot_stays_synthetic(fakes):
     for name in FA:
         rows = controller.kv_store.snapshot_rows("AM")[name][torch.tensor([0, 2])]
         assert torch.equal(controller.kv_store.snapshot_rows("AMsub")[name], rows)
+
+
+# ------------------------------------------------------ drops and describes
+
+
+def test_kv_selection_drop_frees_the_name_for_a_retried_task(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    controller.kv_score(
+        "S", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    first = controller.kv_select(
+        "task", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+    )
+    with pytest.raises(CompactionContractError, match="overwritten"):
+        controller.kv_select(
+            "task", scores="S", budget_tokens=3, policy="shared", aggregate="max"
+        )
+    # A pending boundary capture of the selection's spec reserves the name.
+    controller.arm(expected_prompt_tokens=9, capture_kv=first["capture_spec"])
+    with pytest.raises(CompactionContractError, match="reserved by an operation"):
+        controller.kv_selection_drop("task")
+    controller.operation.failed = "RuntimeError: kernel failed"
+    dropped = controller.kv_selection_drop("task")
+    assert dropped["dropped"] == "task" and dropped["selections"] == {}
+    retried = controller.kv_select(
+        "task", scores="S", budget_tokens=3, policy="shared", aggregate="max"
+    )
+    assert retried["retained_tokens"] == 3
+    with pytest.raises(CompactionContractError, match="Unknown selection"):
+        controller.kv_selection_drop("never")
+    assert set(controller.kv_selections()["selections"]) == {"task"}
+
+
+def test_per_name_describe_returns_one_entry_without_listing(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    controller.kv_capture(
+        {"name": "full", "token_indices": list(range(CTX))}, "ctx", expected_cursor=CTX
+    )
+    controller.kv_capture(
+        {"name": "tiny", "token_indices": [1]}, "ctx", expected_cursor=CTX
+    )
+    described = controller.kv_describe("tiny")
+    assert described["name"] == "tiny" and described["retained_tokens"] == 1
+    assert described["layer_token_indices"] == {name: [1] for name in FA}
+    assert "tensors" not in described
+    assert described == controller.kv_store.list()["snapshots"]["tiny"]
+    with pytest.raises(ValueError, match="Unknown KV snapshot"):
+        controller.kv_describe("ghost")
+    export = controller.q_describe("Q")
+    assert export["name"] == "Q" and export["complete"] and export["rows"] == 6
+    assert export == controller.q_exports()["exports"]["Q"]
+    with pytest.raises(CompactionContractError, match="Unknown query export"):
+        controller.q_describe("ghost")
