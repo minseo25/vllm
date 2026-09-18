@@ -39,6 +39,7 @@ from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
     triton_reshape_and_cache_flash_per_token_head_quant,
+    triton_zero_kv_bias_slots,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import (
@@ -412,6 +413,12 @@ class TritonAttentionBackend(AttentionBackend):
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return True
 
+    @classmethod
+    def supports_kv_bias(cls) -> bool:
+        # Fork: ``unified_attention`` adds ``layer.bias_cache`` to the logits
+        # and ``do_kv_cache_update`` zeroes the written slots (kv_bias.py).
+        return True
+
 
 class TritonAttentionImpl(AttentionImpl):
     # Per-token-head quant: scale views carved from inline head padding.
@@ -688,6 +695,10 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        # Fork: paged per-key logit bias (None unless the layer was allocated
+        # one by vllm.v1.worker.kv_bias); a static tensor for CUDA graphs.
+        bias_cache = getattr(layer, "bias_cache", None)
+
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -725,6 +736,7 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
+            bias_cache=bias_cache,
         )
 
         return output
@@ -800,6 +812,9 @@ class TritonAttentionImpl(AttentionImpl):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
+        # Fork: every written slot's per-key bias is reset to zero in the same
+        # forward, so an imported bias can never outlive its page (kv_bias.py).
+        bias_cache = getattr(layer, "bias_cache", None)
         # Reshape the input keys and values and store them in the cache.
         if self._is_per_token_head_quant:
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
@@ -815,6 +830,8 @@ class TritonAttentionImpl(AttentionImpl):
                 slot_mapping,
                 kv_quant_mode=self._kv_quant_mode,
             )
+            if bias_cache is not None:
+                triton_zero_kv_bias_slots(bias_cache, slot_mapping)
             return
         # For decoder and cross-attention, use KV cache as before.
         # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
@@ -831,6 +848,7 @@ class TritonAttentionImpl(AttentionImpl):
             self.kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
+            bias_cache=bias_cache,
         )
 
     def fused_rope_kvcache_supported(self):
@@ -874,3 +892,6 @@ class TritonAttentionImpl(AttentionImpl):
             flash_layout,
             is_fp8_kv_cache,
         )
+        bias_cache = getattr(layer, "bias_cache", None)
+        if bias_cache is not None:
+            triton_zero_kv_bias_slots(bias_cache, layer_slot_mapping)

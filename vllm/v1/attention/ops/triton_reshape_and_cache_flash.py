@@ -56,6 +56,16 @@ def reshape_and_cache_kernel_flash(
     FP8_KV_CACHE: tl.constexpr,
     # tune parameters
     TILE_SIZE: tl.constexpr,
+    # Fork: zero ``bias_cache[block, head, slot]`` (float32) for every written
+    # slot in the same launch, so a page reused by a later request never
+    # exposes a per-key bias imported for an earlier one. ``None`` keeps the
+    # upstream kernel.
+    bias_cache_ptr=None,
+    bias_stride_blk: int | None = None,
+    bias_stride_head: int | None = None,
+    bias_stride_slot: int | None = None,
+    NUM_HEADS_PADDED: tl.constexpr = 1,
+    ZERO_KV_BIAS: tl.constexpr = False,
 ):
     token_idx = tl.program_id(axis=0)
     slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
@@ -67,6 +77,18 @@ def reshape_and_cache_kernel_flash(
     block_offset = slot_idx % block_size
 
     tile_i = tl.program_id(axis=1)
+    # Constexpr branch first so the dead path is never traced.
+    if ZERO_KV_BIAS:  # noqa: SIM102
+        if tile_i == 0:
+            head_offs = tl.arange(0, NUM_HEADS_PADDED)
+            tl.store(
+                bias_cache_ptr
+                + block_idx * bias_stride_blk
+                + head_offs * bias_stride_head
+                + block_offset * bias_stride_slot,
+                tl.zeros([NUM_HEADS_PADDED], dtype=tl.float32),
+                mask=head_offs < num_heads,
+            )
     tile_offs = tl.arange(0, TILE_SIZE)
     tile_pos = tile_i * TILE_SIZE + tile_offs
     src_key_idx = token_idx * key_stride
@@ -360,6 +382,73 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     )
 
 
+def check_kv_bias_cache(
+    bias_cache: torch.Tensor, num_blocks: int, num_heads: int, block_size: int
+) -> None:
+    """``bias_cache`` must be float32 ``[num_blocks, num_heads, block_size]``."""
+    expected = (num_blocks, num_heads, block_size)
+    if bias_cache.dtype != torch.float32 or tuple(bias_cache.shape) != expected:
+        raise ValueError(
+            "bias_cache must be float32 [num_blocks, num_kv_heads, block_size] = "
+            f"{expected}, got {bias_cache.dtype} {tuple(bias_cache.shape)}"
+        )
+
+
+@triton.jit
+def zero_kv_bias_slots_kernel(
+    bias_cache_ptr,  # [num_blocks, num_heads, block_size] float32
+    slot_mapping_ptr,  # [num_tokens]
+    bias_stride_blk: tl.int64,
+    bias_stride_head: tl.int64,
+    bias_stride_slot: tl.int64,
+    num_heads: tl.constexpr,
+    block_size: tl.constexpr,
+    NUM_HEADS_PADDED: tl.constexpr,
+):
+    token_idx = tl.program_id(axis=0)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+    if slot_idx < 0:
+        return
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+    head_offs = tl.arange(0, NUM_HEADS_PADDED)
+    tl.store(
+        bias_cache_ptr
+        + block_idx * bias_stride_blk
+        + head_offs * bias_stride_head
+        + block_offset * bias_stride_slot,
+        tl.zeros([NUM_HEADS_PADDED], dtype=tl.float32),
+        mask=head_offs < num_heads,
+    )
+
+
+def triton_zero_kv_bias_slots(
+    bias_cache: torch.Tensor,  # [num_blocks, num_heads, block_size] float32
+    slot_mapping: torch.Tensor,  # [num_tokens], negative = padding
+) -> None:
+    """Zero the per-key bias of every slot in ``slot_mapping`` (graph-capturable).
+
+    Used by the cache-write paths that do not go through
+    ``reshape_and_cache_kernel_flash`` (fused rope+cache, per-token-head
+    quantization); the standard path fuses the same store into that kernel.
+    """
+    num_blocks, num_heads, block_size = bias_cache.shape
+    check_kv_bias_cache(bias_cache, num_blocks, num_heads, block_size)
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+    zero_kv_bias_slots_kernel[(num_tokens,)](
+        bias_cache_ptr=bias_cache,
+        slot_mapping_ptr=slot_mapping,
+        bias_stride_blk=bias_cache.stride(0),
+        bias_stride_head=bias_cache.stride(1),
+        bias_stride_slot=bias_cache.stride(2),
+        num_heads=num_heads,
+        block_size=block_size,
+        NUM_HEADS_PADDED=triton.next_power_of_2(num_heads),
+    )
+
+
 def triton_reshape_and_cache_flash(
     key: torch.Tensor,  # [num_tokens, num_heads, head_size]
     value: torch.Tensor,  # [num_tokens, num_heads, head_size]
@@ -371,6 +460,9 @@ def triton_reshape_and_cache_flash(
     kv_cache_dtype: str,  # "auto", "fp8"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
+    # Fork: float32 [num_blocks, num_heads, block_size]; every written slot's
+    # bias is zeroed in the same launch. None keeps the upstream launch.
+    bias_cache: torch.Tensor | None = None,
 ):
     num_heads = key.shape[1]
     head_size = key.shape[2]
@@ -393,6 +485,13 @@ def triton_reshape_and_cache_flash(
     value_stride = value.stride()[0]
     block_stride = key_cache.stride()[0]
     page_stride = key_cache.stride()[1]
+
+    zero_kv_bias = bias_cache is not None
+    if zero_kv_bias:
+        check_kv_bias_cache(bias_cache, key_cache.shape[0], num_heads, block_size)
+        bias_blk, bias_head, bias_slot = bias_cache.stride()
+    else:
+        bias_blk = bias_head = bias_slot = None
 
     assert _is_supported_kv_cache_dtype(kv_cache_dtype), (
         f"Triton reshape-and-cache cannot store kv_cache_dtype={kv_cache_dtype} "
@@ -455,6 +554,12 @@ def triton_reshape_and_cache_flash(
         FP8_KV_CACHE=FP8_KV_CACHE,
         # autotune parameters
         TILE_SIZE=TILE_SIZE,
+        bias_cache_ptr=bias_cache,
+        bias_stride_blk=bias_blk,
+        bias_stride_head=bias_head,
+        bias_stride_slot=bias_slot,
+        NUM_HEADS_PADDED=triton.next_power_of_2(num_heads),
+        ZERO_KV_BIAS=zero_kv_bias,
         num_warps=num_warps,
         num_stages=num_stages,
     )

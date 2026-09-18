@@ -1327,6 +1327,55 @@ def _use_packed_kv_cache_config(
     return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
 
 
+def kv_bias_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Fork: per-block bytes of the per-key bias buffers over every layer.
+
+    A layer whose ``AttentionSpec.kv_bias`` is set keeps a float32
+    ``[num_blocks, num_kv_heads, block_size]`` buffer beside its pages (see
+    ``vllm.v1.worker.kv_bias``); ``num_blocks`` must be sized so that the pages
+    and these buffers together fit the KV budget. Zero for every other model.
+    """
+    total = 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            total += sum(
+                getattr(layer_spec, "kv_bias_bytes_per_block", 0)
+                for layer_spec in spec.kv_cache_specs.values()
+            )
+        else:
+            total += getattr(spec, "kv_bias_bytes_per_block", 0) * len(
+                group.layer_names
+            )
+    return total
+
+
+def kv_memory_after_bias_reservation(
+    available_memory: int, kv_bytes_per_block: int, bias_bytes_per_block: int
+) -> int:
+    """Fork: the KV budget that leaves room for the per-key bias buffers.
+
+    ``num_blocks = result // kv_bytes_per_block == available // (kv + bias)``,
+    so ``num_blocks * (kv_bytes_per_block + bias_bytes_per_block) <= available``.
+    Unchanged when no layer carries a bias buffer.
+    """
+    if bias_bytes_per_block <= 0 or kv_bytes_per_block <= 0:
+        return available_memory
+    reserved = (
+        available_memory
+        * kv_bytes_per_block
+        // (kv_bytes_per_block + bias_bytes_per_block)
+    )
+    logger.info_once(
+        "Reserving %s GiB of the KV cache budget for per-key attention bias "
+        "buffers (%d bytes per block beside %d KV bytes per block).",
+        format_gib(available_memory - reserved),
+        bias_bytes_per_block,
+        kv_bytes_per_block,
+    )
+    return reserved
+
+
 def _get_kv_cache_config_packed(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1339,6 +1388,9 @@ def _get_kv_cache_config_packed(
     """
     block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
 
+    available_memory = kv_memory_after_bias_reservation(
+        available_memory, block_stride, kv_bias_bytes_per_block(kv_cache_groups)
+    )
     num_blocks = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
@@ -1390,9 +1442,13 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden sizes. Allocate different amount of memory for each
         # layer based on its hidden size.
-        num_blocks = (
-            available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        uniform_page_size = kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        available_memory = kv_memory_after_bias_reservation(
+            available_memory,
+            uniform_page_size,
+            kv_bias_bytes_per_block(kv_cache_groups),
         )
+        num_blocks = available_memory // uniform_page_size
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
@@ -1423,6 +1479,11 @@ def get_kv_cache_config_from_groups(
             [group.kv_cache_spec for group in kv_cache_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
+        available_memory = kv_memory_after_bias_reservation(
+            available_memory,
+            page_size * group_size,
+            kv_bias_bytes_per_block(kv_cache_groups),
+        )
         num_blocks = get_num_blocks(
             vllm_config, group_size, available_memory, page_size
         )

@@ -222,6 +222,7 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.kv_bias import allocate_kv_bias_caches, layer_supports_kv_bias
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
@@ -471,6 +472,9 @@ class GPUModelRunner(
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.compaction: NativeCompactionController | None = None
+        # Fork: per-key logit bias buffers of bias-capable attention layers
+        # (vllm.v1.worker.kv_bias), filled by initialize_kv_cache.
+        self.kv_bias_caches: dict[str, torch.Tensor] = {}
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -7727,6 +7731,15 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        # Fork: zeroed float32 per-key bias buffers beside the pages of every
+        # bias-capable attention layer; budgeted per block by kv_cache_utils
+        # from the specs' ``kv_bias`` flag set in get_kv_cache_spec.
+        self.kv_bias_caches = allocate_kv_bias_caches(
+            kv_caches,
+            self.compilation_config.static_forward_context,
+            self.shared_kv_cache_layers,
+            self.device,
+        )
 
         if (
             self.speculative_config
@@ -7900,6 +7913,9 @@ class GPUModelRunner(
                     with set_current_vllm_config(self.vllm_config):
                         indexes = backend.indexes_kv_by_block_stride()
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
+                    if layer_supports_kv_bias(attn_module):
+                        # Fork: budget the per-key bias buffer beside each page.
+                        spec = replace(spec, kv_bias=True)
                 kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec

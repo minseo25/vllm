@@ -59,13 +59,15 @@ def geometry(dtype=torch.float32, heads=Q_HEADS, kv_heads=KV_HEADS, layers=FA):
     }
 
 
-def fa_layer(index, name, dtype=torch.float32):
+def fa_layer(index, name, dtype=torch.float32, bias=False):
+    """``bias=True`` models a Triton-backend layer with a paged bias buffer."""
     cache = (
         torch.arange(8 * KV_HEADS * BLOCK * 2 * HEAD, dtype=torch.float32).reshape(
             8, KV_HEADS, BLOCK, 2 * HEAD
         )
         + 1000.0 * index
     ).to(dtype)
+    backend = "TRITON_ATTN" if bias else "FLASH_ATTN"
     return NS(
         layer_name=name,
         kv_cache=cache,
@@ -74,8 +76,9 @@ def fa_layer(index, name, dtype=torch.float32):
         num_heads=Q_HEADS,
         dtype=dtype,
         impl=NS(scale=HEAD**-0.5),
-        get_attn_backend=lambda: NS(get_name=lambda: "FLASH_ATTN"),
+        get_attn_backend=lambda: NS(get_name=lambda: backend),
         compaction_q_export=None,
+        bias_cache=torch.zeros(8, KV_HEADS, BLOCK) if bias else None,
     )
 
 
@@ -98,14 +101,16 @@ def gdn_metadata(requests, num_decodes=0):
     )
 
 
-def make_controller(requests, *, consumed=None, dtype=torch.float32):
+def make_controller(requests, *, consumed=None, dtype=torch.float32, bias=False):
     """Requests: (id, cursor, query_count, descriptor|None, state_index).
 
     ``consumed`` seeds the controller's tracked cursors (what it saw consumed);
-    the batch copies hold the request cursors given in ``requests``.
+    the batch copies hold the request cursors given in ``requests``. ``bias``
+    gives every FA layer a paged bias buffer (bias-capable backend).
     """
     controller = object.__new__(NativeCompactionController)
     controller.store = SnapshotStore()
+    controller.fresh_decode_rows_zeroed = 0
     controller.operation = None
     controller.operations = {}
     controller._descriptors = {}
@@ -118,7 +123,7 @@ def make_controller(requests, *, consumed=None, dtype=torch.float32):
     controller.metadata_types = {"gdn": NS}
     controller.fa_layers = set(FA)
     controller.fa_layer_groups = {name: 0 for name in FA}
-    layers = {name: fa_layer(i, name, dtype) for i, name in enumerate(FA)}
+    layers = {name: fa_layer(i, name, dtype, bias) for i, name in enumerate(FA)}
     kv_store = object.__new__(NativeKVSnapshotStore)
     kv_store._entries, kv_store._staged = {}, {}
     kv_store.layers = layers
@@ -830,7 +835,17 @@ class FakeAMResult:
     """Mirrors ``compaction_methods.am.AMResult`` for the shared case."""
 
     def __init__(
-        self, chosen, k, v, fixed, *, chunk, budget, max_fit_workspace_bytes=None
+        self,
+        chosen,
+        k,
+        v,
+        fixed,
+        *,
+        chunk,
+        budget,
+        max_fit_workspace_bytes=None,
+        bias=False,
+        mass_weighting=None,
     ):
         index = torch.tensor(chosen)
         heads = k.shape[1]
@@ -841,14 +856,33 @@ class FakeAMResult:
         values[fixed_rows] = v[index][fixed_rows]  # frozen frame rows keep V
         self.v_c = values.transpose(0, 1).contiguous()
         self.beta = None
+        if bias:
+            # beta[h, j] = h + (j + 1) / 4 on free rows, exactly 0 on frame rows.
+            rows = torch.arange(1, len(chosen) + 1, dtype=torch.float32) / 4
+            beta = torch.arange(heads, dtype=torch.float32)[:, None] + rows[None, :]
+            beta[:, fixed_rows] = 0.0
+            self.beta = beta
         self.fixed_mask = fixed_rows[None, :].repeat(heads, 1)
         self.shared = True
         self.warnings = ["fake-am-warning"]
         policy = "fixed" if fixed else "refit"
+        mass = f"_mass{mass_weighting}" if bias else ""
         self.variant = (
-            f"fake_am_rmskeys_ols_nobias_uniform_offpolicy_frame{policy}_chol64"
+            f"fake_am_rmskeys_ols_{'bias' if bias else 'nobias'}_uniform_offpolicy"
+            f"{mass}_frame{policy}_chol64"
         )
         self.diagnostics = {
+            **(
+                {
+                    "mass_weighting": mass_weighting,
+                    "mass_error_before": [1.0] * heads,
+                    "mass_error_after": [0.5] * heads,
+                    "bias_fallback": [False] * heads,
+                    "any_bias_fallback": False,
+                }
+                if bias
+                else {}
+            ),
             "frame_policy": policy,
             "n_fixed": len(fixed),
             "n_protected": len(chosen) - len(fixed) if policy == "refit" else 0,
@@ -884,6 +918,7 @@ class FakeAMResult:
 class FakeAM:
     def __init__(self):
         self.calls = []
+        self.results = []
 
     def compact(
         self,
@@ -901,6 +936,7 @@ class FakeAM:
         chunk=2048,
         memory_budget_bytes=None,
         max_fit_workspace_bytes=None,
+        mass_weighting=None,
     ):
         self.calls.append(
             dict(
@@ -915,6 +951,7 @@ class FakeAM:
                 memory_budget_bytes=memory_budget_bytes,
                 max_fit_workspace_bytes=max_fit_workspace_bytes,
                 v_dtype=v.dtype,
+                mass_weighting=mass_weighting,
             )
         )
         chosen = list(protected) + list(fixed)
@@ -923,7 +960,7 @@ class FakeAM:
                 break
             if i not in chosen:
                 chosen.append(i)
-        return FakeAMResult(
+        result = FakeAMResult(
             sorted(chosen),
             k,
             v,
@@ -931,7 +968,11 @@ class FakeAM:
             chunk=chunk,
             budget=budget,
             max_fit_workspace_bytes=max_fit_workspace_bytes,
+            bias=bias,
+            mass_weighting=mass_weighting,
         )
+        self.results.append(result)
+        return result
 
 
 @pytest.fixture
@@ -943,10 +984,10 @@ def fakes():
     return bundle
 
 
-def resident_controller():
+def resident_controller(bias=False):
     """One resident request whose worker cursor copy lags the consumed cursor."""
     controller, layers, _ = make_controller(
-        [("ctx", LAGGING, 1, None, 2)], consumed={"ctx": CTX}
+        [("ctx", LAGGING, 1, None, 2)], consumed={"ctx": CTX}, bias=bias
     )
     return controller, layers
 
@@ -1604,8 +1645,17 @@ def test_compute_ops_fail_closed_on_missing_library_and_bad_outputs(monkeypatch)
     compaction_q.register_methods(am=FakeAM())
     with pytest.raises(CompactionContractError, match="exceeds the source keys"):
         controller.kv_fit_am("AM", budget_tokens=7, **common)
-    for bad_params in ({"iters": 3}, {"mass_weighting": "shifted"}):
+    for bad_params in ({"iters": 3}, {"head_budget": "per_head"}):
         with pytest.raises(CompactionContractError, match="Unknown am params"):
+            controller.kv_fit_am("AM", budget_tokens=2, params=bad_params, **common)
+    # bias / mass_weighting are accepted names now (AM bias variant) but
+    # still fail closed on malformed values and on a bias-less backend.
+    for bad_params, message in (
+        ({"mass_weighting": "harmonic"}, "mass_weighting must be"),
+        ({"bias": 1}, "bias must be a bool"),
+        ({"bias": True}, "cannot apply per-key bias"),
+    ):
+        with pytest.raises(CompactionContractError, match=message):
             controller.kv_fit_am("AM", budget_tokens=2, params=bad_params, **common)
     assert controller.kv_store.list()["snapshots"] == {}
 
@@ -1786,6 +1836,227 @@ def test_real_methods_library_contract_on_tiny_tensors():
         for name in FA
     }
     controller.kv_store.restore("AM2", "fresh", 1, metadata, 2)
+
+
+# -------------------------------------------------------------------- bias
+
+
+def fa_metadata(controller):
+    table = controller.runner.input_batch.block_table[0].get_cpu_tensor()
+    return {name: NS(block_table=table) for name in FA}
+
+
+def test_kv_fit_am_bias_passes_mass_weighting_and_registers_token_major_beta(fakes):
+    """``params['bias']`` reaches the library with ``mass_weighting``; beta comes
+    back ``[Hkv, t]`` and is stored token-major ``[t, Hkv]`` float32 with frame
+    rows 0, advertised in the receipt and written into the paged bias buffers
+    at exactly the imported slots."""
+    controller, layers = resident_controller(bias=True)
+    fill_export(controller, "Q", [0, 6])
+    info = controller.info()
+    assert "kv_bias" in info["compute_ops"] and "bias" in info["store_ops"]
+    assert info["kv_bias"] is True and info["fa_backends"] == ["TRITON_ATTN"]
+    assert info["kv_bias_bytes"] == len(FA) * 8 * KV_HEADS * BLOCK * 4
+    receipt = controller.kv_fit_am(
+        "AMb",
+        q_export="Q",
+        budget_tokens=3,
+        request_id="ctx",
+        expected_cursor=CTX,
+        protected=[1],
+        params={"bias": True, "mass_weighting": "shifted"},
+    )
+    call = fakes.am.calls[0]
+    assert (call["bias"], call["mass_weighting"]) == (True, "shifted")
+    assert receipt["has_bias"] is True and receipt["bias"] is True
+    assert receipt["bias_bytes"] == len(FA) * 3 * KV_HEADS * 4
+    assert "beta" not in receipt
+    method = receipt["method"]
+    assert receipt["variant"] == method["name"]
+    assert method["alias"] == "am_bias_uniform"
+    assert "_bias_uniform_offpolicy_massshifted_framefixed_" in method["name"]
+    # Library diagnostics are forwarded verbatim per layer.
+    for name in FA:
+        forwarded = method["diagnostics"][name]
+        assert forwarded["mass_error_before"] == [1.0] * KV_HEADS
+        assert forwarded["mass_error_after"] == [0.5] * KV_HEADS
+        assert forwarded["bias_fallback"] == [False] * KV_HEADS
+        assert forwarded["identity_shortcut"] is False
+    params = method["params"]
+    assert (params["bias"], params["mass_weighting"]) == (True, "shifted")
+    assert params["bias_fallback"] == {name: [False] * KV_HEADS for name in FA}
+    assert params["any_bias_fallback"] == {name: False for name in FA}
+    assert params["mass_error_after"] == {name: [0.5] * KV_HEADS for name in FA}
+    assert params["beta_layout"].startswith("[retained_tokens, num_kv_heads]")
+    for name in FA:
+        error = params["output_error_after_cast_in_sample"][name]
+        assert len(error["rel"]) == KV_HEADS and error["max_rel"] >= 0.0
+    beta = controller.kv_store.snapshot_bias("AMb")
+    assert set(beta) == set(FA)
+    for index, name in enumerate(FA):
+        stored = beta[name]
+        assert stored.shape == (3, KV_HEADS) and stored.dtype == torch.float32
+        assert torch.equal(stored, fakes.am.results[index].beta.T)
+        assert torch.all(stored[0] == 0)  # protected token 1 is the frozen frame
+        assert torch.all(stored[1:] != 0)
+    # Import into row 1 (blocks [3, 4]): rows and beta land on the same slots.
+    for layer in layers.values():
+        layer.bias_cache.fill_(-7.0)
+    result = controller.kv_store.restore("AMb", "fresh", 1, fa_metadata(controller), 3)
+    assert result["has_bias"] is True and result["bias_bytes"] == receipt["bias_bytes"]
+    for name in FA:
+        bias = layers[name].bias_cache
+        assert torch.equal(bias[3, :, :3].T, beta[name])
+        assert torch.all(bias[3, :, 3:] == -7.0) and torch.all(bias[4] == -7.0)
+    # The default path is unchanged: no mass_weighting reaches the library, no
+    # beta is registered and the nobias record keeps its shape.
+    plain = controller.kv_fit_am(
+        "AMn",
+        q_export="Q",
+        budget_tokens=3,
+        request_id="ctx",
+        expected_cursor=CTX,
+        protected=[1],
+    )
+    assert fakes.am.calls[-1]["bias"] is False
+    assert fakes.am.calls[-1]["mass_weighting"] is None
+    assert plain["has_bias"] is False and plain["bias_bytes"] == 0
+    assert plain["bias"] is False and plain["variant"] == plain["method"]["name"]
+    assert plain["method"]["alias"] == "am_nobias_uniform"
+    assert plain["method"]["params"]["bias"] is False
+    assert "mass_weighting" not in plain["method"]["params"]
+    assert plain["digest"] != receipt["digest"] or plain["bias_digest"] is None
+    assert controller.kv_store.snapshot_bias("AMn") is None
+    # A snapshot without beta imports as beta = 0 on a bias-capable store.
+    controller.kv_store.restore("AMn", "fresh2", 1, fa_metadata(controller), 3)
+    for name in FA:
+        assert torch.all(layers[name].bias_cache[3, :, :3] == 0)
+        assert torch.all(layers[name].bias_cache[3, :, 3:] == -7.0)
+
+
+def test_kv_fit_am_bias_is_refused_before_any_fit_without_a_bias_buffer(fakes):
+    controller, layers = resident_controller()  # FLASH_ATTN fakes, no buffer
+    fill_export(controller, "Q", [0, 6])
+    info = controller.info()
+    assert "kv_bias" not in info["compute_ops"] and "bias" not in info["store_ops"]
+    assert info["kv_bias"] is False and info["kv_bias_bytes"] == 0
+    assert info["fa_backends"] == ["FLASH_ATTN"]
+    with pytest.raises(CompactionContractError, match="cannot apply per-key bias"):
+        controller.kv_fit_am(
+            "AM",
+            q_export="Q",
+            budget_tokens=3,
+            request_id="ctx",
+            expected_cursor=CTX,
+            params={"bias": True},
+        )
+    assert fakes.am.calls == []
+    assert controller.kv_store.list()["snapshots"] == {}
+    # mass_weighting without bias is accepted and ignored (recorded verbatim).
+    receipt = controller.kv_fit_am(
+        "AM",
+        q_export="Q",
+        budget_tokens=3,
+        request_id="ctx",
+        expected_cursor=CTX,
+        params={"mass_weighting": "shifted"},
+    )
+    assert fakes.am.calls[0]["bias"] is False
+    assert fakes.am.calls[0]["mass_weighting"] is None
+    assert receipt["has_bias"] is False
+
+
+@pytest.mark.parametrize(
+    "fault,message",
+    [
+        ("none", "AM beta must be finite"),
+        ("transposed", "AM beta must be finite"),
+        ("nan", "AM beta must be finite"),
+        ("fixed", "zero on fixed rows"),
+    ],
+)
+def test_kv_fit_am_bias_fails_closed_on_malformed_library_beta(fakes, fault, message):
+    controller, layers = resident_controller(bias=True)
+    fill_export(controller, "Q", [0, 6])
+    real = fakes.am
+
+    def compact(q, k, v, budget, **kwargs):
+        result = real.compact(q, k, v, budget, **kwargs)
+        if fault == "none":
+            result.beta = None
+        elif fault == "transposed":
+            result.beta = result.beta.T.contiguous()
+        elif fault == "nan":
+            result.beta = result.beta.clone().fill_(float("nan"))
+        elif fault == "fixed":
+            result.beta = result.beta.clone()
+            result.beta[:, result.fixed_mask[0]] = 1.0
+        return result
+
+    compaction_q.register_methods(am=NS(compact=compact))
+    with pytest.raises(CompactionContractError, match=message):
+        controller.kv_fit_am(
+            "AM",
+            q_export="Q",
+            budget_tokens=3,
+            request_id="ctx",
+            expected_cursor=CTX,
+            protected=[1],
+            params={"bias": True},
+        )
+    assert controller.kv_store.list()["snapshots"] == {}
+    for layer in layers.values():
+        assert not layer.bias_cache.any()
+
+
+def test_real_methods_library_bias_contract_on_tiny_tensors():
+    """Contract-drift guard for the bias variant: ``compact(..., bias=True,
+    mass_weighting=)`` returns finite ``beta [Hkv, t]`` that is 0 on fixed rows
+    and imports through the bias-capable store."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    try:
+        library = compaction_q.resolve_methods("am")
+    except CompactionContractError as error:
+        pytest.fail(f"real methods library unavailable at {REPO_ROOT}: {error}")
+    assert library.__name__ == "profiling.compaction_methods.am"
+    controller, layers = resident_controller(bias=True)
+    generator = torch.Generator().manual_seed(0)
+    for layer in layers.values():
+        layer.kv_cache.copy_(torch.randn(layer.kv_cache.shape, generator=generator))
+    fill_export(controller, "R", [4, 6])
+    for name in FA:
+        controller.q_store._entries["R"]["tensors"][name].copy_(
+            torch.randn(2, Q_HEADS, HEAD, generator=generator)
+        )
+    for mass_weighting in ("uniform", "shifted"):
+        receipt = controller.kv_fit_am(
+            f"AMb_{mass_weighting}",
+            q_export="R",
+            budget_tokens=3,
+            request_id="ctx",
+            expected_cursor=CTX,
+            key_range=[0, 4],
+            protected=[0],
+            params={"bias": True, "mass_weighting": mass_weighting},
+        )
+        assert receipt["method"]["name"].startswith(
+            f"am_rmskeys_ols_bias_uniform_offpolicy_mass{mass_weighting}_framefixed"
+        )
+        assert receipt["method"]["alias"] == "am_bias_uniform"
+        assert receipt["has_bias"] is True
+        params = receipt["method"]["params"]
+        assert params["mass_weighting"] == mass_weighting
+        assert set(params["bias_fallback"]) == set(FA)
+        beta = controller.kv_store.snapshot_bias(f"AMb_{mass_weighting}")
+        for name in FA:
+            assert beta[name].shape == (3, KV_HEADS)
+            assert torch.isfinite(beta[name]).all()
+            assert torch.all(beta[name][0] == 0)  # fixed frame token 0
+    controller.kv_store.restore("AMb_uniform", "fresh", 1, fa_metadata(controller), 3)
+    beta = controller.kv_store.snapshot_bias("AMb_uniform")
+    for name in FA:
+        assert torch.equal(layers[name].bias_cache[3, :, :3].T, beta[name])
 
 
 # ------------------------------------------------------------------ subset

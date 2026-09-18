@@ -466,6 +466,10 @@ class Attention(nn.Module, AttentionLayerBase):
         # by bind_kv_cache
         # this variable will not be accessed if use_direct_call is True
         self.kv_cache = torch.tensor([])
+        # Fork: float32 per-key logit bias [num_blocks, num_kv_heads,
+        # block_size] beside the pages, allocated by the model runner only when
+        # the backend supports it (vllm.v1.worker.kv_bias); None otherwise.
+        self.bias_cache: torch.Tensor | None = None
 
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)

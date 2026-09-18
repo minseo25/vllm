@@ -289,6 +289,15 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    # Fork: paged per-key logit bias ``bias_cache[block, kv_head, slot]``
+    # (float32) added to the scaled logits before the online softmax (native
+    # compaction attention matching). ``None`` (USE_KV_BIAS=False) leaves the
+    # compiled kernel identical to the upstream one.
+    bias_cache_ptr=None,
+    stride_bias_blk: int | None = None,
+    stride_bias_head: int | None = None,
+    stride_bias_slot: int | None = None,
+    USE_KV_BIAS: tl.constexpr = False,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -511,6 +520,17 @@ def kernel_unified_attention(
                 v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
             )
 
+        if USE_KV_BIAS:
+            # kv_bias : (TILE_SIZE,) float32, one additive logit per key.
+            kv_bias = tl.load(
+                bias_cache_ptr
+                + physical_block_idx * stride_bias_blk
+                + kv_head_idx * stride_bias_head
+                + (seq_offset % BLOCK_SIZE) * stride_bias_slot,
+                mask=tile_mask,
+                other=0.0,
+            ).to(tl.float32)
+
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
             query_abs_pos,
@@ -543,6 +563,9 @@ def kernel_unified_attention(
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
+
+        if USE_KV_BIAS:
+            S += kv_bias[None, :]
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
@@ -847,6 +870,10 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    # Fork: paged per-key logit bias, float32
+    # [num_blocks, num_kv_heads, block_size]; added to the scaled logits of
+    # every key (prefill and decode). None keeps the upstream code path.
+    bias_cache: torch.Tensor | None = None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -858,6 +885,9 @@ def unified_attention(
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
         assert use_causal and not use_per_seq_causal, (
             "INT4_PER_TOKEN_HEAD only supports causal attention"
+        )
+        assert bias_cache is None, (
+            "per-key bias is not supported with an INT4 per-token-head KV cache"
         )
         from vllm.v1.attention.ops.int4_per_token_head import (
             unified_attention_int4,
@@ -928,6 +958,18 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+
+    use_kv_bias = bias_cache is not None
+    if use_kv_bias:
+        expected = (k.shape[0], num_kv_heads, block_size)
+        if bias_cache.dtype != torch.float32 or tuple(bias_cache.shape) != expected:
+            raise ValueError(
+                "bias_cache must be float32 [num_blocks, num_kv_heads, block_size] "
+                f"= {expected}, got {bias_cache.dtype} {tuple(bias_cache.shape)}"
+            )
+        bias_blk, bias_head, bias_slot = bias_cache.stride()
+    else:
+        bias_blk = bias_head = bias_slot = None
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -1163,6 +1205,11 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+        bias_cache_ptr=bias_cache,
+        stride_bias_blk=bias_blk,
+        stride_bias_head=bias_head,
+        stride_bias_slot=bias_slot,
+        USE_KV_BIAS=use_kv_bias,
         **launch_kwargs,
     )
 

@@ -147,6 +147,11 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
         # attention is not supported, so gate it here at backend selection.
         return attn_type == AttentionType.DECODER
 
+    @classmethod
+    def supports_kv_bias(cls) -> bool:
+        # ``unified_attention_diffkv`` has no per-key bias path (fork).
+        return False
+
 
 class TritonAttentionDiffKVImpl(TritonAttentionImpl):
     """Triton attention impl for the DiffKV packed KV cache layout."""

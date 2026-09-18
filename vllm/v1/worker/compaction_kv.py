@@ -18,6 +18,15 @@ Snapshot entries come from two sources and import through one ``restore`` path:
 
 Row layout per layer is the cache's ``[tokens, num_kv_heads, 2 * head_size]``
 with keys in ``[..., :head_size]`` and values in ``[..., head_size:]``.
+
+A snapshot may also carry a per-key logit bias ``beta`` per layer, a float32
+``[tokens, num_kv_heads]`` tensor aligned with the rows (attention matching's
+``softmax(q C_k^T + beta) C_v``). Import writes it into the layer's paged bias
+buffer (``layer.bias_cache``, see ``vllm.v1.worker.kv_bias``) at exactly the
+slots that receive the rows and is refused when the backend has none; capture
+records the bias found at the captured slots when any of it is non-zero, so a
+chained import keeps it. Every normal KV write zeroes the bias of the written
+slots, so a snapshot without ``beta`` imports as ``beta = 0``.
 """
 
 from __future__ import annotations
@@ -29,8 +38,29 @@ from typing import Any
 
 import torch
 
+from vllm.v1.worker.kv_bias import KV_BIAS_DTYPE, UNSUPPORTED_MESSAGE, bias_cache_of
+
 SUPPORTED_BACKENDS = {"FLASH_ATTN", "TRITON_ATTN"}
 SUPPORTED_CACHE_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+
+
+BETA_SUFFIX = "#beta"
+
+
+def _beta_key(layer_name: str) -> str:
+    """Key of a layer's staged bias rows beside its staged KV rows."""
+    return f"{layer_name}{BETA_SUFFIX}"
+
+
+def _split_staged(
+    staged: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Staged copies -> (KV rows by layer, bias rows by layer)."""
+    rows = {k: v for k, v in staged.items() if not k.endswith(BETA_SUFFIX)}
+    beta = {
+        k[: -len(BETA_SUFFIX)]: v for k, v in staged.items() if k.endswith(BETA_SUFFIX)
+    }
+    return rows, beta
 
 
 def _digest(tensors: dict[str, torch.Tensor]) -> str:
@@ -156,6 +186,86 @@ class NativeKVSnapshotStore:
             raise ValueError(f"Unsupported exact-KV cache layout: {name}")
         return cache
 
+    def _bias_cache(self, name: str, layer: Any) -> torch.Tensor | None:
+        """The layer's paged bias buffer (validated), or None without one."""
+        try:
+            return bias_cache_of(layer)
+        except ValueError as error:
+            raise ValueError(f"{error}: {name}") from error
+
+    def bias_supported(self) -> bool:
+        """Every FA layer carries a paged bias buffer the kernel applies."""
+        return bool(self.layers) and all(
+            self._bias_cache(name, layer) is not None
+            for name, layer in self.layers.items()
+        )
+
+    def bias_bytes(self) -> int:
+        """Device bytes of the paged bias buffers over the FA layers."""
+        return sum(
+            bias.numel() * bias.element_size()
+            for name, layer in self.layers.items()
+            if (bias := self._bias_cache(name, layer)) is not None
+        )
+
+    def _validate_beta(
+        self, beta: Any, retained_tokens: int
+    ) -> dict[str, torch.Tensor] | None:
+        """``beta`` is None or ``{layer: float32 [retained_tokens, num_kv_heads]}``."""
+        if beta is None:
+            return None
+        if not isinstance(beta, dict) or set(beta) != set(self.layers):
+            raise ValueError("beta must map exactly the FA layers")
+        copied = {}
+        for name, layer in self.layers.items():
+            cache = self._check_layout(name, layer)
+            tensor = beta[name]
+            if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != (
+                retained_tokens,
+                cache.shape[1],
+            ):
+                raise ValueError(
+                    f"beta shape must be [retained_tokens, num_kv_heads]: {name}"
+                )
+            if tensor.dtype != KV_BIAS_DTYPE:
+                raise ValueError(f"beta dtype must be float32: {name}")
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(f"Non-finite beta values: {name}")
+            copied[name] = tensor.detach().to("cpu", copy=True).contiguous()
+        return copied
+
+    @staticmethod
+    def _bias_fields(beta: dict[str, torch.Tensor] | None) -> dict:
+        """Entry fields for the bias rows; ``digest`` stays the KV-only digest."""
+        return {
+            "beta": beta,
+            "has_bias": beta is not None,
+            "bias_bytes": (
+                sum(t.numel() * t.element_size() for t in beta.values()) if beta else 0
+            ),
+            "bias_digest": _digest(beta) if beta else None,
+        }
+
+    def _capture_bias(
+        self, locations: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ) -> dict[str, torch.Tensor] | None:
+        """Bias rows at the captured slots; None when every layer reads zero."""
+        gathered = {}
+        for name, (cache, blocks, offsets) in locations.items():
+            bias = self._bias_cache(name, self.layers[name])
+            if bias is None:
+                rows = torch.zeros(
+                    (blocks.numel(), cache.shape[1]), dtype=KV_BIAS_DTYPE
+                )
+            else:
+                rows = bias[blocks, :, offsets].detach().cpu().clone()
+            gathered[name] = rows.contiguous()
+        if not all(bool(torch.isfinite(t).all()) for t in gathered.values()):
+            raise ValueError("Non-finite selected KV bias values")
+        if not any(bool(t.any()) for t in gathered.values()):
+            return None
+        return gathered
+
     def _locations(
         self,
         row: int,
@@ -238,6 +348,7 @@ class NativeKVSnapshotStore:
         }
         if not all(bool(torch.isfinite(t).all()) for t in tensors.values()):
             raise ValueError("Non-finite selected KV values")
+        beta = self._capture_bias(locations)
         first = next(iter(per_layer.values()))
         self._entries[spec["name"]] = {
             "name": spec["name"],
@@ -255,6 +366,7 @@ class NativeKVSnapshotStore:
             "digest": _digest(tensors),
             "digest_verified_at": "capture",
             "tensors": tensors,
+            **self._bias_fields(beta),
         }
         return self.describe(spec["name"])
 
@@ -271,6 +383,7 @@ class NativeKVSnapshotStore:
         layer_token_indices: dict[str, list[int]] | None = None,
         token_indices: list[int] | None = None,
         request_id: str | None = None,
+        beta: dict[str, torch.Tensor] | None = None,
     ) -> dict:
         """Store rows computed outside the cache as an importable snapshot.
 
@@ -280,6 +393,9 @@ class NativeKVSnapshotStore:
         how the rows were produced (``name``, ``params``, ``inputs`` digests) and
         must be JSON-serializable. Optional ``layer_token_indices`` or
         ``token_indices`` record which source tokens the rows stand for.
+        Optional ``beta`` gives a per-key logit bias per layer, float32
+        ``[retained_tokens, num_kv_heads]`` aligned with the rows (frame rows 0);
+        it imports only into layers that carry a paged bias buffer.
         """
         if not isinstance(name, str) or not name:
             raise ValueError("KV snapshot name must be nonempty")
@@ -339,6 +455,7 @@ class NativeKVSnapshotStore:
             if not bool(torch.isfinite(tensor).all()):
                 raise ValueError(f"Non-finite synthetic KV values: {layer_name}")
             copied[layer_name] = tensor.detach().to("cpu", copy=True).contiguous()
+        beta = self._validate_beta(beta, retained_tokens)
         self._entries[name] = {
             "name": name,
             "request_id": request_id,
@@ -361,6 +478,7 @@ class NativeKVSnapshotStore:
             "digest": _digest(copied),
             "digest_verified_at": "register",
             "tensors": copied,
+            **self._bias_fields(beta),
         }
         return self.describe(name)
 
@@ -403,6 +521,12 @@ class NativeKVSnapshotStore:
         self.describe(name)
         return dict(self._entries[name]["tensors"])
 
+    def snapshot_bias(self, name: str) -> dict[str, torch.Tensor] | None:
+        """The immutable CPU bias rows ``{layer: [tokens, num_kv_heads]}`` or None."""
+        self.describe(name)
+        beta = self._entries[name].get("beta")
+        return dict(beta) if beta else None
+
     # ---------------------------------------------------------------- subset
     def subset(
         self,
@@ -440,7 +564,8 @@ class NativeKVSnapshotStore:
         else:
             spec["layer_token_indices"] = layer_token_indices
         policy, per_layer = self._layer_indices(spec, origin["source_cursor"])
-        tensors = {}
+        tensors: dict[str, torch.Tensor] = {}
+        beta_rows: dict[str, torch.Tensor] = {}
         for layer_name, requested in per_layer.items():
             available = origin["layer_token_indices"][layer_name]
             position_of = {token: row for row, token in enumerate(available)}
@@ -454,6 +579,11 @@ class NativeKVSnapshotStore:
             tensors[layer_name] = (
                 origin["tensors"][layer_name][rows].contiguous().clone()
             )
+            if origin.get("beta"):
+                beta_rows[layer_name] = (
+                    origin["beta"][layer_name][rows].contiguous().clone()
+                )
+        beta = beta_rows or None
         first = next(iter(per_layer.values()))
         self._entries[name] = {
             "name": name,
@@ -478,6 +608,7 @@ class NativeKVSnapshotStore:
             "digest": _digest(tensors),
             "digest_verified_at": "subset",
             "tensors": tensors,
+            **self._bias_fields(beta),
         }
         return self.describe(name)
 
@@ -487,7 +618,7 @@ class NativeKVSnapshotStore:
             raise ValueError(f"Unknown KV snapshot: {name}")
         result = {}
         for key, value in self._entries[name].items():
-            if key == "tensors":
+            if key in ("tensors", "beta"):
                 continue
             if key == "token_indices":
                 result[key] = list(value) if value is not None else None
@@ -511,6 +642,9 @@ class NativeKVSnapshotStore:
         return {
             "snapshots": snapshots,
             "total_cpu_snapshot_bytes": sum(s["bytes"] for s in snapshots.values()),
+            "total_cpu_bias_bytes": sum(
+                s.get("bias_bytes", 0) for s in snapshots.values()
+            ),
             "total_gpu_staging_bytes": sum(
                 s["staged_gpu_bytes"] for s in snapshots.values()
             ),
@@ -524,21 +658,40 @@ class NativeKVSnapshotStore:
         ):
             raise ValueError("KV staging device must match the cache device")
         if name not in self._staged:
-            self._staged[name] = {
+            staged = {
                 key: tensor.to(self.layers[key].kv_cache.device, copy=True)
                 for key, tensor in self._entries[name]["tensors"].items()
             }
+            for key, tensor in (self._entries[name].get("beta") or {}).items():
+                staged[_beta_key(key)] = tensor.to(
+                    self.layers[key].kv_cache.device, copy=True
+                )
+            self._staged[name] = staged
         return self.describe(name)
 
     def audit(self, name: str) -> dict:
         entry = self._entries[name]
+        beta = entry.get("beta")
         cpu_digest = _digest(entry["tensors"])
-        gpu_digest = _digest(self._staged[name]) if name in self._staged else None
-        if cpu_digest != entry["digest"] or (
-            gpu_digest is not None and gpu_digest != entry["digest"]
+        cpu_bias_digest = _digest(beta) if beta else None
+        gpu_digest = gpu_bias_digest = None
+        if name in self._staged:
+            rows, staged_beta = _split_staged(self._staged[name])
+            gpu_digest = _digest(rows)
+            gpu_bias_digest = _digest(staged_beta) if staged_beta else None
+        if (
+            cpu_digest != entry["digest"]
+            or cpu_bias_digest != entry.get("bias_digest")
+            or (gpu_digest is not None and gpu_digest != entry["digest"])
+            or (name in self._staged and gpu_bias_digest != entry.get("bias_digest"))
         ):
             raise ValueError("An immutable KV snapshot was modified")
-        return {**self.describe(name), "audited": True, "staged_digest": gpu_digest}
+        return {
+            **self.describe(name),
+            "audited": True,
+            "staged_digest": gpu_digest,
+            "staged_bias_digest": gpu_bias_digest,
+        }
 
     # --------------------------------------------------------------- restore
     def validate_restore(
@@ -561,12 +714,19 @@ class NativeKVSnapshotStore:
         tensors = self._entries[name]["tensors"]
         if set(tensors) != set(locations):
             raise ValueError("KV snapshot layer set differs")
+        beta = self._entries[name].get("beta")
         for key, (cache, _, _) in locations.items():
             if (
                 tensors[key].shape != (computed_tokens, cache.shape[1], cache.shape[3])
                 or tensors[key].dtype != cache.dtype
             ):
                 raise ValueError(f"KV import shape/dtype differs: {key}")
+            bias = self._bias_cache(key, self.layers[key])
+            if beta is not None:
+                if bias is None:
+                    raise ValueError(f"{UNSUPPORTED_MESSAGE}: {key}")
+                if tuple(beta[key].shape) != (computed_tokens, cache.shape[1]):
+                    raise ValueError(f"KV bias import shape differs: {key}")
 
     def restore(
         self,
@@ -585,6 +745,15 @@ class NativeKVSnapshotStore:
             page_bytes += (
                 blocks.unique().numel() * cache[0].numel() * cache.element_size()
             )
+            bias = self._bias_cache(key, self.layers[key])
+            if bias is not None:
+                # The same slots as the rows: the snapshot's bias, or zero for a
+                # snapshot without one (the normal write already zeroed them).
+                staged_beta = self._staged[name].get(_beta_key(key))
+                if staged_beta is None:
+                    bias[blocks, :, offsets] = 0.0
+                else:
+                    bias[blocks, :, offsets] = staged_beta
         entry = self._entries[name]
         return {
             "name": name,
@@ -593,6 +762,9 @@ class NativeKVSnapshotStore:
             "source_cursor": entry["source_cursor"],
             "retained_tokens": computed_tokens,
             "payload_bytes": entry["bytes"],
+            "has_bias": entry.get("has_bias", False),
+            "bias_bytes": entry.get("bias_bytes", 0),
+            "bias_digest": entry.get("bias_digest"),
             "occupied_kernel_page_bytes": page_bytes,
             "source_digest": entry["digest"],
             "selection_policy": entry["selection_policy"],

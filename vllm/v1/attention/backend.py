@@ -259,6 +259,18 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_kv_bias(cls) -> bool:
+        """Whether the paged kernel can add a per-key logit bias (fork).
+
+        A bias-capable backend reads a float32 ``bias_cache`` of shape
+        ``[num_blocks, num_kv_heads, block_size]`` beside the KV cache and adds
+        ``bias[block, head, slot]`` to the scaled logits before the softmax.
+        The native compaction store imports attention-matching biases through
+        it (``vllm.v1.worker.kv_bias``).
+        """
+        return False
+
+    @classmethod
     def supports_sliding_window(cls) -> bool:
         return False
 

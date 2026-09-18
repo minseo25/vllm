@@ -643,3 +643,59 @@ def test_triton_unified_attn_use_td_tile_clamp(
         soft_cap=None,
         seq_threshold_3D=0,
     )
+
+
+# ------------------------------------------------------------ paged per-key bias
+# Fork: ``unified_attention(..., bias_cache=[num_blocks, kv_heads, block_size])``
+# adds one float32 logit per key before the online softmax (native compaction
+# attention matching); the reshape-and-cache kernels zero the written slots.
+
+from tests.kernels.attention.kv_bias_reference import (  # noqa: E402
+    check_attention_bias,
+    check_block_reuse_reads_zero_bias,
+    check_cache_write_zeroes_bias,
+)
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="paged per-key bias kernels need CUDA"
+)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+)
+@pytest.mark.parametrize("num_heads", [(4, 4), (8, 2), (5, 1)])
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("seq_threshold_3D", SEQ_THRESHOLD_3D_VALUES)
+@torch.inference_mode()
+def test_triton_unified_attn_kv_bias(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    seq_threshold_3D: int,
+) -> None:
+    """Kernel with/without bias vs the torch reference; zero bias == no bias."""
+    check_attention_bias(
+        torch.device("cuda"),
+        torch.bfloat16,
+        seq_lens,
+        num_heads,
+        head_size,
+        seq_threshold_3D,
+        num_blocks=2048,
+        atol=1.5e-2,
+        rtol=1e-2,
+    )
+
+
+@requires_cuda
+@torch.inference_mode()
+def test_triton_reshape_and_cache_zeroes_kv_bias_of_written_slots() -> None:
+    check_cache_write_zeroes_bias(torch.device("cuda"), torch.bfloat16)
+
+
+@requires_cuda
+@torch.inference_mode()
+def test_block_reused_after_a_bias_import_attends_with_zero_bias() -> None:
+    check_block_reuse_reads_zero_bias(torch.device("cuda"), torch.bfloat16)

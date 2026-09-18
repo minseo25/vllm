@@ -188,6 +188,18 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
     indexes_kv_by_block_stride: bool = False
+    kv_bias: bool = False
+    """Fork: the layer's attention backend keeps a float32 per-key logit bias
+    ``[num_blocks, num_kv_heads, block_size]`` beside its pages (native
+    compaction attention matching). Set by the model runner from the backend;
+    ``kv_bias_bytes_per_block`` is then budgeted next to every page when the
+    KV pool is sized. It does not change the page layout itself."""
+
+    @property
+    def kv_bias_bytes_per_block(self) -> int:
+        if not self.kv_bias:
+            return 0
+        return self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -312,6 +324,7 @@ class FullAttentionSpec(AttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
+            kv_bias=specs[0].kv_bias,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             # If any layer in the group is non-causal, treat the group as
@@ -452,6 +465,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
+            kv_bias=specs[0].kv_bias,
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
@@ -508,6 +522,7 @@ class RSWASpec(FullAttentionSpec):
             kv_quant_mode=base.kv_quant_mode,
             page_size_padded=base.page_size_padded,
             indexes_kv_by_block_stride=base.indexes_kv_by_block_stride,
+            kv_bias=base.kv_bias,
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
@@ -690,6 +705,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
+            kv_bias=specs[0].kv_bias,
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
@@ -814,6 +830,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
+            kv_bias=specs[0].kv_bias,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),

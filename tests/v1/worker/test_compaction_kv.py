@@ -429,3 +429,254 @@ def test_read_rows_rejects_unconsumed_or_malformed_selections(indices, kwargs, m
     store, _, metadata = fixture_store()
     with pytest.raises(ValueError, match=message):
         store.read_rows(0, metadata, indices, **kwargs)
+
+
+# --------------------------------------------------------------------- bias
+
+
+def bias_store(with_bias=True):
+    """Layers on a bias-capable backend carrying ``bias_cache`` [blocks, kv, slots]."""
+    store, layers, metadata = fixture_store()
+    backend = NS(get_name=lambda: "TRITON_ATTN")
+    for layer in layers.values():
+        layer.get_attn_backend = lambda backend=backend: backend
+        if with_bias:
+            layer.bias_cache = torch.zeros(8, 2, 4)
+    return store, layers, metadata
+
+
+def beta_rows(layers, value=1.0):
+    """Token-major [3, kv_heads] biases with the frame row (row 0) at zero."""
+    return {
+        name: torch.tensor([[0.0, 0.0], [0.5, -1.0], [2.0, 3.0]]) * value
+        for name in layers
+    }
+
+
+def test_registered_beta_imports_into_the_bias_buffer_at_the_row_slots():
+    store, layers, metadata = bias_store()
+    assert store.bias_supported() is True and store.bias_bytes() == 2 * 8 * 2 * 4 * 4
+    tensors = {
+        name: torch.full((3, 2, 6), float(i + 1), dtype=torch.float32)
+        for i, name in enumerate(layers)
+    }
+    beta = beta_rows(layers)
+    receipt = store.register(
+        "fit",
+        tensors,
+        source_cursor=10,
+        source_position_offset=0,
+        retained_tokens=3,
+        method=method_record(),
+        layer_token_indices={"a": [0, 1, 9], "b": [2, 3, 4]},
+        beta=beta,
+    )
+    assert receipt["has_bias"] is True and receipt["bias_bytes"] == 2 * 3 * 2 * 4
+    assert "beta" not in receipt and "tensors" not in receipt
+    assert store.list()["total_cpu_bias_bytes"] == 48
+    # ``digest`` covers the K/V rows only; the bias has its own digest.
+    plain = store.register(
+        "same_rows_no_bias",
+        {name: t.clone() for name, t in tensors.items()},
+        source_cursor=10,
+        source_position_offset=0,
+        retained_tokens=3,
+        method=method_record(),
+    )
+    assert plain["digest"] == receipt["digest"]
+    assert plain["bias_digest"] is None and isinstance(receipt["bias_digest"], str)
+    # The entry holds its own copy of beta.
+    beta["a"].fill_(99.0)
+    assert torch.all(store.snapshot_bias("fit")["a"][0] == 0)
+    for layer in layers.values():
+        layer.bias_cache.fill_(7.0)
+    result = store.restore("fit", "target", 1, metadata, 3)  # row 1 -> block 5
+    assert result["has_bias"] is True and result["bias_bytes"] == 48
+    for name, layer in layers.items():
+        assert torch.equal(
+            layer.bias_cache[5, :, :3].T, store.snapshot_bias("fit")[name]
+        )
+        assert torch.all(layer.bias_cache[5, :, 3:] == 7.0)
+        assert torch.all(layer.bias_cache[:5] == 7.0) and torch.all(
+            layer.bias_cache[6:] == 7.0
+        )
+        assert torch.all(
+            layer.kv_cache[5, :, :3, :] == float(list(layers).index(name) + 1)
+        )
+    store.audit("fit")
+
+
+def test_capture_keeps_imported_bias_so_chained_imports_carry_it():
+    store, layers, metadata = bias_store()
+    tensors = {name: torch.full((3, 2, 6), 4.0) for name in layers}
+    beta = beta_rows(layers)
+    receipt = store.register(
+        "fit",
+        tensors,
+        source_cursor=10,
+        source_position_offset=0,
+        retained_tokens=3,
+        method=method_record(),
+        beta=beta,
+    )
+    store.restore("fit", "target", 1, metadata, 3)
+    chained = store.capture(
+        {"name": "chain", "token_indices": [0, 1, 2]}, "target", 1, metadata, 3
+    )
+    assert chained["has_bias"] is True and chained["bias_bytes"] == 48
+    assert chained["digest"] == receipt["digest"]  # K/V rows round-trip
+    assert chained["bias_digest"] == receipt["bias_digest"]  # and so does beta
+    for name in layers:
+        assert torch.equal(store.snapshot_bias("chain")[name], beta[name])
+    # Rows whose bias reads zero are captured without a bias record.
+    plain = store.capture(
+        {"name": "plain", "token_indices": [0, 1]}, "s", 0, metadata, 4
+    )
+    assert plain["has_bias"] is False and plain["bias_bytes"] == 0
+    assert store.snapshot_bias("plain") is None
+    # A snapshot without bias imports as bias 0 where the buffer held values.
+    for layer in layers.values():
+        layer.bias_cache.fill_(5.0)
+    result = store.restore("plain", "t2", 1, metadata, 2)
+    assert result["has_bias"] is False
+    for layer in layers.values():
+        assert torch.all(layer.bias_cache[5, :, :2] == 0)
+        assert torch.all(layer.bias_cache[5, :, 2:] == 5.0)
+    # Subsets of a bias snapshot slice the bias rows with the KV rows.
+    subset = store.subset("sub", "chain", method=method_record(), token_indices=[0, 2])
+    assert subset["has_bias"] is True and subset["bias_bytes"] == 2 * 2 * 2 * 4
+    for name in layers:
+        assert torch.equal(store.snapshot_bias("sub")[name], beta[name][[0, 2]])
+
+
+def test_staged_bias_is_audited_with_the_rows():
+    store, layers, metadata = bias_store()
+    tensors = {name: torch.full((3, 2, 6), 4.0) for name in layers}
+    store.register(
+        "fit",
+        tensors,
+        source_cursor=10,
+        source_position_offset=0,
+        retained_tokens=3,
+        method=method_record(),
+        beta=beta_rows(layers),
+    )
+    store.stage("fit", "cpu")
+    assert set(store._staged["fit"]) == {"a", "b", "a#beta", "b#beta"}
+    audited = store.audit("fit")
+    assert audited["staged_digest"] == audited["digest"]
+    assert audited["staged_bias_digest"] == audited["bias_digest"]
+    store._staged["fit"]["a#beta"].fill_(0.0)
+    with pytest.raises(ValueError, match="modified"):
+        store.audit("fit")
+    store.stage("fit", "cpu")  # already staged: the mutated copy stays
+    store._staged["fit"]["a#beta"].copy_(store.snapshot_bias("fit")["a"])
+    store.audit("fit")
+    store._entries["fit"]["beta"]["b"].fill_(0.0)
+    with pytest.raises(ValueError, match="modified"):
+        store.audit("fit")
+
+
+def test_beta_snapshot_is_refused_when_the_backend_has_no_bias_buffer():
+    store, layers, metadata = fixture_store()  # FLASH_ATTN layers, no buffer
+    assert store.bias_supported() is False and store.bias_bytes() == 0
+    tensors = {name: torch.full((3, 2, 6), 4.0) for name in layers}
+    receipt = store.register(
+        "fit",
+        tensors,
+        source_cursor=10,
+        source_position_offset=0,
+        retained_tokens=3,
+        method=method_record(),
+        beta=beta_rows(layers),
+    )
+    assert receipt["has_bias"] is True  # registering is allowed, importing is not
+    before = {name: layer.kv_cache.clone() for name, layer in layers.items()}
+    with pytest.raises(ValueError, match="cannot apply per-key bias"):
+        store.validate_restore("fit", "target", 1, metadata, 3)
+    with pytest.raises(ValueError, match="cannot apply per-key bias"):
+        store.restore("fit", "target", 1, metadata, 3)
+    assert all(torch.equal(layers[n].kv_cache, before[n]) for n in layers)
+    # Only one layer with a buffer is still unsupported (all-or-nothing).
+    layers["a"].bias_cache = torch.zeros(8, 2, 4)
+    assert store.bias_supported() is False
+    with pytest.raises(ValueError, match=r"cannot apply per-key bias.*: b$"):
+        store.restore("fit", "target", 1, metadata, 3)
+    assert all(torch.equal(layers[n].kv_cache, before[n]) for n in layers)
+    assert not layers["a"].bias_cache.any()
+
+
+@pytest.mark.parametrize(
+    "mutate,message",
+    [
+        (lambda b: {**b, "a": b["a"].T.contiguous()}, "beta shape"),
+        (lambda b: {**b, "a": b["a"][:2]}, "beta shape"),
+        (lambda b: {**b, "a": b["a"].to(torch.float64)}, "beta dtype"),
+        (lambda b: {**b, "a": b["a"].clone().fill_(float("inf"))}, "Non-finite beta"),
+        (lambda b: {"a": b["a"]}, "exactly the FA layers"),
+        (lambda b: {**b, "c": b["a"]}, "exactly the FA layers"),
+        (lambda b: {**b, "a": b["a"].tolist()}, "beta shape"),
+        (lambda b: [b["a"], b["b"]], "exactly the FA layers"),
+    ],
+)
+def test_register_rejects_malformed_beta(mutate, message):
+    store, layers, metadata = bias_store()
+    tensors = {name: torch.full((3, 2, 6), 4.0) for name in layers}
+    with pytest.raises(ValueError, match=message):
+        store.register(
+            "bad",
+            tensors,
+            source_cursor=10,
+            source_position_offset=0,
+            retained_tokens=3,
+            method=method_record(),
+            beta=mutate(beta_rows(layers)),
+        )
+    assert store.list()["snapshots"] == {}
+
+
+def test_bias_buffer_layout_mismatch_is_rejected_before_any_write():
+    store, layers, metadata = bias_store()
+    layers["b"].bias_cache = torch.zeros(8, 2, 4, dtype=torch.bfloat16)
+    tensors = {name: torch.full((3, 2, 6), 4.0) for name in layers}
+    with pytest.raises(ValueError, match="bias_cache must be float32.*: b"):
+        store.register(
+            "fit",
+            tensors,
+            source_cursor=10,
+            source_position_offset=0,
+            retained_tokens=3,
+            method=method_record(),
+            beta=beta_rows(layers),
+        )
+        store.restore("fit", "target", 1, metadata, 3)
+
+
+def test_block_reused_after_an_import_reads_zero_bias():
+    """The normal KV write zeroes the bias of exactly the slots it writes, so a
+    page that later serves another request never exposes the imported bias."""
+    from vllm.v1.worker.kv_bias import zero_kv_bias_slots
+
+    store, layers, metadata = bias_store()
+    tensors = {name: torch.full((3, 2, 6), 4.0) for name in layers}
+    store.register(
+        "fit",
+        tensors,
+        source_cursor=10,
+        source_position_offset=0,
+        retained_tokens=3,
+        method=method_record(),
+        beta=beta_rows(layers),
+    )
+    store.restore("fit", "target", 1, metadata, 3)  # block 5, slots 0..2
+    for layer in layers.values():
+        assert layer.bias_cache[5, :, 1:3].any()
+        # The next request's prefill writes block 5 slots 0..1 (and a padded
+        # token): only those slots are reset, slot 2 keeps its value until it
+        # is written too.
+        zero_kv_bias_slots(layer.bias_cache, torch.tensor([20, 21, -1]))
+        assert not layer.bias_cache[5, :, :2].any()
+        assert layer.bias_cache[5, :, 2].any()
+        zero_kv_bias_slots(layer.bias_cache, torch.tensor([22, 23]))
+        assert not layer.bias_cache[5].any()
+        assert layer.kv_cache[5, :, :3, :].eq(4.0).all()  # rows are untouched

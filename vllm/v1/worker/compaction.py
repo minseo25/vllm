@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.v1.worker.kv_bias import UNSUPPORTED_MESSAGE as KV_BIAS_UNSUPPORTED
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -1032,6 +1034,9 @@ class NativeCompactionController:
         }
 
     def info(self) -> dict:
+        # Paged per-key bias (AM bias variant): only on a bias-capable backend.
+        kv_store = getattr(self, "kv_store", None)
+        kv_bias = kv_store is not None and kv_store.bias_supported()
         return {
             "backend": "vllm_native",
             "implementation": "vllm.v1.worker.compaction.NativeCompactionController",
@@ -1059,6 +1064,7 @@ class NativeCompactionController:
                 "kv_score",
                 "kv_select",
                 "kv_fit_am",
+                *(["kv_bias"] if kv_bias else []),
             ],
             "store_ops": [
                 "kv_subset",
@@ -1068,7 +1074,17 @@ class NativeCompactionController:
                 "kv_drop",
                 "q_drop",
                 "score_drop",
+                *(["bias"] if kv_bias else []),
             ],
+            "kv_bias": kv_bias,
+            "kv_bias_bytes": kv_store.bias_bytes() if kv_bias else 0,
+            # Resolved attention backend of the FA layers (what kv_bias follows).
+            "fa_backends": sorted(
+                {
+                    layer.get_attn_backend().get_name()
+                    for layer in (kv_store.layers.values() if kv_store else ())
+                }
+            ),
             "consumed_cursor_tracking": "controller_tracked_expected_cursor_required",
             "scope": "native_per_request_boundary_intervention",
         }
@@ -2605,21 +2621,28 @@ class NativeCompactionController:
         params: dict | None = None,
         key_range: Any = None,
     ) -> dict:
-        """Attention matching, M1 form: selected original keys + OLS-fitted values.
+        """Attention matching: selected original keys, OLS-fitted values, optional bias.
 
-        Per FA layer ``am.compact(q_ref, k, v, budget, bias=False,
+        Per FA layer ``am.compact(q_ref, k, v, budget, bias=<params['bias']>,
         head_budget='uniform', fixed=<frame positions>, protected=<refit-able
-        positions>, scale=, ridge=, chunk= | memory_budget_bytes=)``. ``protected``
-        (token indices) are the frame: frozen with their original K and V
-        (``fixed=``, beta = 0) unless ``params['refit_protected']`` makes them
-        refit-able (``protected=``). Values are fitted in float32 (``v`` is passed
-        as float32) and cast once to the cache dtype here; the value-space cast
-        error and, unless ``params['output_error']`` is False, the post-cast
-        attention-output error of the stored rows against the full cache are
+        positions>, scale=, ridge=, chunk= | memory_budget_bytes=[,
+        mass_weighting=])``. ``protected`` (token indices) are the frame: frozen
+        with their original K and V (``fixed=``, beta = 0) unless
+        ``params['refit_protected']`` makes them refit-able (``protected=``).
+        Values are fitted in float32 (``v`` is passed as float32) and cast once to
+        the cache dtype here; the value-space cast error and, unless
+        ``params['output_error']`` is False, the post-cast attention-output error
+        of the stored rows (with beta when fitted) against the full cache are
         recorded. ``method.name`` is the library variant (for example
         ``am_rmskeys_ols_nobias_uniform_offpolicy_framefixed_chol64``), ``alias``
-        ``am_nobias_uniform``. ``iters``/``mass_weighting`` (bias, M2) are refused.
-        Resident sources require ``expected_cursor``.
+        ``am_nobias_uniform`` or ``am_bias_uniform``. ``params['bias']`` (default
+        False) fits the per-key logit bias by NNLS mass matching with
+        ``params['mass_weighting']`` ('uniform' | 'shifted', default 'uniform')
+        and registers it beside the rows as float32 ``[t, num_kv_heads]`` per
+        layer (frame rows 0); it needs every FA layer to carry a paged bias
+        buffer (Triton attention backend, ``info()['compute_ops']`` lists
+        ``kv_bias``) and is refused otherwise. ``iters`` and per-head budgets stay
+        refused. Resident sources require ``expected_cursor``.
         """
         compaction_q = _q_module()
         params = compaction_q._check_params(
@@ -2632,9 +2655,23 @@ class NativeCompactionController:
                 "refit_protected",
                 "memory_budget_bytes",
                 "output_error",
+                "bias",
+                "mass_weighting",
             },
             "am",
         )
+        bias = params.get("bias", False)
+        mass_weighting = params.get("mass_weighting", "uniform")
+        if not isinstance(bias, bool):
+            raise CompactionContractError("bias must be a bool")
+        if mass_weighting not in ("uniform", "shifted"):
+            raise CompactionContractError(
+                "mass_weighting must be 'uniform' or 'shifted'"
+            )
+        if bias and not self.kv_store.bias_supported():
+            raise CompactionContractError(
+                f"kv_fit_am(bias=True) refused: {KV_BIAS_UNSUPPORTED}"
+            )
         if type(budget_tokens) is not int or budget_tokens < 1:
             raise CompactionContractError("budget_tokens must be a positive integer")
         if not isinstance(name_out, str) or not name_out:
@@ -2661,7 +2698,7 @@ class NativeCompactionController:
         )
         budget = self._budget(params)
         started = time.perf_counter()
-        synthetic, layer_tokens, kv_digests = {}, {}, {}
+        synthetic, layer_tokens, kv_digests, betas = {}, {}, {}, {}
         casts, variants, diagnostics, summaries, scales = set(), set(), {}, {}, {}
         cast_errors, output_errors, blockings, fixed_positions = {}, {}, {}, {}
         library_warnings, fit_workspace = {}, {}
@@ -2691,7 +2728,12 @@ class NativeCompactionController:
                 params=params,
                 budget_bytes=budget,
                 max_fit_workspace_bytes=capacity["bytes"],
+                bias=bias,
+                mass_weighting=mass_weighting,
             )
+            if bias:
+                # Library beta is [Hkv, t]; the store keeps token-major rows.
+                betas[name] = fit["beta"].transpose(0, 1).contiguous()
             fit_workspace[name] = {
                 "capacity": capacity,
                 "admission": fit["summary"].get("fit_workspace_admission"),
@@ -2725,6 +2767,7 @@ class NativeCompactionController:
                     fitted,
                     scale=scales[name],
                     budget_bytes=int(error_budget["bytes"]),
+                    **({"beta": fit["beta"].to(keys.device)} if bias else {}),
                 )
                 output_errors[name]["memory_budget"] = error_budget
             variants.add(fit["variant"])
@@ -2745,9 +2788,31 @@ class NativeCompactionController:
             )
         first_summary = next(iter(summaries.values()))
         digest_inputs = bool(params.get("digest_inputs"))
+        bias_record = (
+            {
+                "mass_weighting": mass_weighting,
+                "beta_layout": (
+                    "[retained_tokens, num_kv_heads] float32, frame rows 0"
+                ),
+                "mass_error_before": {
+                    n: s.get("mass_error_before") for n, s in summaries.items()
+                },
+                "mass_error_after": {
+                    n: s.get("mass_error_after") for n, s in summaries.items()
+                },
+                "bias_fallback": {
+                    n: s.get("bias_fallback") for n, s in summaries.items()
+                },
+                "any_bias_fallback": {
+                    n: s.get("any_bias_fallback") for n, s in summaries.items()
+                },
+            }
+            if bias
+            else {}
+        )
         method = {
             "name": variants.pop(),
-            "alias": "am_nobias_uniform",
+            "alias": "am_bias_uniform" if bias else "am_nobias_uniform",
             "params": {
                 **params,
                 "blocking": blockings,
@@ -2760,7 +2825,8 @@ class NativeCompactionController:
                 "fixed_tokens": fixed_positions,
                 "n_fixed": {n: s.get("n_fixed") for n, s in summaries.items()},
                 "n_protected": {n: s.get("n_protected") for n, s in summaries.items()},
-                "bias": False,
+                "bias": bias,
+                **bias_record,
                 "head_budget": "uniform",
                 "solver": first_summary.get("solver"),
                 "compute_dtype": first_summary.get("compute_dtype"),
@@ -2808,7 +2874,10 @@ class NativeCompactionController:
             method=method,
             layer_token_indices=layer_tokens,
             request_id=source.get("request_id"),
+            beta=betas if bias else None,
         )
+        receipt["variant"] = method["name"]
+        receipt["bias"] = bias
         receipt["seconds"] = time.perf_counter() - started
         return receipt
 

@@ -1070,6 +1070,11 @@ AM_SUMMARY_KEYS = (
     "max_fit_workspace_bytes",
     "fit_workspace_admission",
     "warnings",
+    "mass_weighting",
+    "mass_error_before",
+    "mass_error_after",
+    "bias_fallback",
+    "any_bias_fallback",
 )
 
 
@@ -1114,24 +1119,33 @@ def fit_am_layer(
     params: dict,
     budget_bytes: dict | None = None,
     max_fit_workspace_bytes: int | None = None,
+    bias: bool = False,
+    mass_weighting: str = "uniform",
 ) -> dict:
-    """Call ``am.compact`` (no bias, uniform head budget) for one layer.
+    """Call ``am.compact`` (uniform head budget, optional bias) for one layer.
 
     Contract (``profiling.compaction_methods.am``): ``compact(q_ref, k, v, budget,
-    bias=False, head_budget='uniform', protected=, fixed=, scale=, ridge=,
-    chunk= | memory_budget_bytes=)`` returns an ``AMResult``: ``token_indices()``
-    lists the shared ascending key positions (``len == budget``, containing
-    ``protected`` and ``fixed``), ``cache_layout()`` gives ``(k_c, v_c)`` as
-    ``[t, Hkv, D]`` rows aligned with them, ``fixed_mask`` (``bool [Hkv, t]``)
-    marks frozen frame rows. ``fixed`` tokens keep their original K *and* V
-    (frame policy ``fixed``; asserted here row by row); ``protected`` tokens are
-    kept but refit-able (``refit``). ``k_c`` must equal the original keys and
-    ``beta`` must be ``None`` (bias, per-head budgets, ``iters`` and
-    ``mass_weighting`` are M2 and are refused by the caller's param allowlist).
-    ``v_c`` comes back in ``v``'s dtype; pass a float32 ``v`` to obtain
-    pre-cast values. Returns ``{"indices", "k_c", "v_c", "fixed_positions",
-    "variant", "diagnostics", "summary", "blocking"}``.
+    bias=, head_budget='uniform', protected=, fixed=, scale=, ridge=,
+    chunk= | memory_budget_bytes=[, mass_weighting=])`` returns an ``AMResult``:
+    ``token_indices()`` lists the shared ascending key positions (``len ==
+    budget``, containing ``protected`` and ``fixed``), ``cache_layout()`` gives
+    ``(k_c, v_c)`` as ``[t, Hkv, D]`` rows aligned with them, ``fixed_mask``
+    (``bool [Hkv, t]``) marks frozen frame rows. ``fixed`` tokens keep their
+    original K *and* V (frame policy ``fixed``; asserted here row by row);
+    ``protected`` tokens are kept but refit-able (``refit``). ``k_c`` must equal
+    the original keys. With ``bias=False`` (the ``*_nobias`` variant) ``beta``
+    must be ``None``; with ``bias=True`` (``mass_weighting`` is passed through)
+    ``beta`` must be a finite float ``[Hkv, t]`` that is exactly zero on fixed
+    rows, returned here as float32 on the CPU. Per-head budgets and ``iters``
+    stay refused by the caller's param allowlist. ``v_c`` comes back in ``v``'s
+    dtype; pass a float32 ``v`` to obtain pre-cast values. Returns
+    ``{"indices", "k_c", "v_c", "beta", "fixed_positions", "variant",
+    "diagnostics", "summary", "blocking"}``.
     """
+    if not isinstance(bias, bool):
+        raise CompactionContractError("bias must be a bool")
+    if mass_weighting not in ("uniform", "shifted"):
+        raise CompactionContractError("mass_weighting must be 'uniform' or 'shifted'")
     if (
         k.ndim != 3
         or v.shape != k.shape
@@ -1154,6 +1168,7 @@ def fit_am_layer(
     if isinstance(ridge, bool) or not isinstance(ridge, (int, float)) or ridge < 0:
         raise CompactionContractError("ridge must be a nonnegative number")
     blocking = _blocking(params, budget_bytes)
+    bias_kwargs = {"mass_weighting": mass_weighting} if bias else {}
     result = _call_library(
         "am",
         "compact",
@@ -1161,7 +1176,7 @@ def fit_am_layer(
         k,
         v,
         budget,
-        bias=False,
+        bias=bias,
         head_budget="uniform",
         protected=list(protected),
         fixed=list(fixed),
@@ -1169,9 +1184,23 @@ def fit_am_layer(
         ridge=ridge,
         max_fit_workspace_bytes=max_fit_workspace_bytes,
         **blocking,
+        **bias_kwargs,
     )
-    if getattr(result, "beta", None) is not None:
-        raise CompactionContractError("AM beta is not importable in M1 (bias=False)")
+    beta = getattr(result, "beta", None)
+    if not bias:
+        if beta is not None:
+            raise CompactionContractError(
+                "AM beta is not importable in M1 (bias=False)"
+            )
+    elif (
+        not isinstance(beta, torch.Tensor)
+        or tuple(beta.shape) != (int(k.shape[1]), budget)
+        or not beta.dtype.is_floating_point
+        or not bool(torch.isfinite(beta).all())
+    ):
+        raise CompactionContractError("AM beta must be finite [Hkv, budget] with bias")
+    else:
+        beta = beta.detach().to(dtype=torch.float32).cpu()
     if (
         not getattr(result, "shared", False)
         or not callable(getattr(result, "token_indices", None))
@@ -1233,11 +1262,14 @@ def fit_am_layer(
             raise CompactionContractError(
                 "AM v_c differs from the original values on fixed rows"
             )
+        if beta is not None and bool(beta[:, fixed_rows].ne(0).any()):
+            raise CompactionContractError("AM beta must be zero on fixed rows")
     diagnostics = _jsonable(getattr(result, "diagnostics", {}))
     return {
         "indices": indices,
         "k_c": k_c.detach(),
         "v_c": v_c.detach(),
+        "beta": beta,
         "fixed_positions": sorted(flagged),
         "variant": str(getattr(result, "variant", "unknown")),
         "warnings": _jsonable(list(getattr(result, "warnings", None) or [])),
@@ -1273,14 +1305,16 @@ def attention_output_error(
     *,
     scale: float,
     budget_bytes: int = DEFAULT_MEMORY_BUDGET_BYTES,
+    beta: torch.Tensor | None = None,
 ) -> dict:
     """In-sample output error of the *stored* compacted rows against the cache.
 
     Per kv head ``h`` (query heads ``h*G .. (h+1)*G-1``, contiguous GQA blocks) in
     float32: ``Y_ref = softmax(scale q K_h^T) V_h`` over all ``T`` keys and
-    ``Y_c = softmax(scale q K_c^T) V_c`` over the retained rows exactly as they
-    will sit in the cache (after any dtype cast, no bias), for the same reference
-    queries the fit used. Memory: only per-head key/value slices and one query
+    ``Y_c = softmax(scale q K_c^T + beta_h) V_c`` over the retained rows exactly
+    as they will sit in the cache (after any dtype cast; ``beta`` is the
+    ``[Hkv, t]`` per-key bias the kernel adds, zero when None), for the same
+    reference queries the fit used. Memory: only per-head key/value slices and one query
     block are cast to float32; the block holds ``rows_per_block =
     budget_bytes // (3 * (T + t) * 4)`` grouped rows (two float32 logits blocks
     plus slack, the library's ``chunk_for_budget`` rule with ``g = 1`` because
@@ -1295,6 +1329,11 @@ def attention_output_error(
         raise CompactionContractError("output error: head layout mismatch")
     if type(budget_bytes) is not int or budget_bytes < 1:
         raise CompactionContractError("budget_bytes must be a positive integer")
+    if beta is not None and (
+        not isinstance(beta, torch.Tensor)
+        or tuple(beta.shape) != (kv_heads, int(k_c.shape[0]))
+    ):
+        raise CompactionContractError("output error: beta must be [Hkv, t]")
     group = heads // kv_heads
     tokens, retained = int(k.shape[0]), int(k_c.shape[0])
     rows_per_block = max(1, budget_bytes // (3 * (tokens + retained) * 4))
@@ -1307,6 +1346,7 @@ def attention_output_error(
             values_h = v[:, h, :].detach().float()
             keys_c = k_c[:, h, :].detach().to(device).float()
             values_c = v_c[:, h, :].detach().to(device).float()
+            beta_h = None if beta is None else beta[h].detach().to(device).float()
             numerator = denominator = 0.0
             for start in range(0, int(q.shape[0]), queries_per_block):
                 block = (
@@ -1316,7 +1356,10 @@ def attention_output_error(
                     .float()
                 )
                 y_ref = torch.softmax(block @ keys_h.T * scale, dim=-1) @ values_h
-                y_c = torch.softmax(block @ keys_c.T * scale, dim=-1) @ values_c
+                logits_c = block @ keys_c.T * scale
+                if beta_h is not None:
+                    logits_c = logits_c + beta_h[None, :]
+                y_c = torch.softmax(logits_c, dim=-1) @ values_c
                 numerator += float(((y_ref - y_c) ** 2).sum())
                 denominator += float((y_ref**2).sum())
             absolute.append(math.sqrt(numerator))
