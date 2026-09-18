@@ -2359,3 +2359,78 @@ def test_requires_query_export_inspects_rows_without_binding_or_allocating():
     assert controller.requires_query_export(1, np.array([1])) is True
     controller.operation.closed = True
     assert controller.requires_query_export(1, np.array([1])) is False
+
+
+# ------------------------------------------------------------------- disarm
+
+
+def test_disarm_closes_an_operation_that_never_bound_so_arming_works_again():
+    requests = [("r", 0, 3, None, 2)]
+    controller, layers, _ = make_controller(requests)
+    controller.arm(
+        expected_prompt_tokens=3, export_q={"name": "Q", "token_range": [0, 3]}
+    )
+    # Admission failed after arming: no forward ever ran for this operation.
+    with pytest.raises(CompactionContractError, match="boundary was not reached"):
+        controller.result()
+    with pytest.raises(CompactionContractError, match="Call cc_result"):
+        controller.arm(expected_prompt_tokens=3)
+    receipt = controller.disarm()
+    assert receipt["disarmed"] and receipt["never_bound"] and receipt["legacy"]
+    assert receipt["failed"] is None and receipt["forward_calls"] == 0
+    assert receipt["export_q"] == {"name": "Q", "token_range": [0, 3]}
+    assert receipt["export_dropped"] and controller.q_exports()["exports"] == {}
+    with pytest.raises(CompactionContractError, match="No armed operation"):
+        controller.disarm()
+    # The engine is idle: arming succeeds and the export name is free again.
+    assert controller.arm(
+        expected_prompt_tokens=3, export_q={"name": "Q", "token_range": [0, 3]}
+    )["armed"]
+    metadata, positions, counts = forward_inputs(requests, controller)
+    boundary = controller.before_forward(metadata, positions, counts)
+    # A bound, live operation cannot be disarmed.
+    with pytest.raises(CompactionContractError, match="bound live operation"):
+        controller.disarm()
+    run_attention(layers, query_batch(3), metadata)
+    controller.after_forward(boundary)
+    assert controller.result()["q_export"]["complete"]
+    # A bound but failed operation may be disarmed (closed) as well.
+    controller.arm(expected_prompt_tokens=3)
+    advance(controller, requests)
+    controller.before_forward(metadata, positions, counts)
+    controller.fail_forward(RuntimeError("kernel failed"))
+    receipt = controller.disarm()
+    assert not receipt["never_bound"] and "kernel failed" in receipt["failed"]
+    assert controller.arm(expected_prompt_tokens=3)["armed"]
+
+
+def test_disarm_addresses_descriptor_operations_by_id():
+    desc = dict(operation_id="d", expected_prompt_tokens=3)
+    requests = [("r", 0, 3, desc, 2)]
+    controller, layers, _ = make_controller(requests)
+    with pytest.raises(CompactionContractError, match="Unknown operation"):
+        controller.disarm("d")
+    metadata, positions, counts = forward_inputs(requests, controller)
+    boundary = controller.before_forward(metadata, positions, counts)
+    with pytest.raises(CompactionContractError, match="bound live operation"):
+        controller.disarm("d")
+    controller.after_forward(boundary)
+    assert controller.results(["d"])["d"]["forward_calls"] == 1
+    # A descriptor operation whose forward failed before binding is retired.
+    other = dict(operation_id="f", expected_prompt_tokens=3, restore_name="missing")
+    requests = [("s", 0, 3, other, 3)]
+    controller.runner.requests["s"] = NS(
+        mm_features=[],
+        prompt_embeds=None,
+        lora_request=None,
+        num_computed_tokens=0,
+        num_prompt_tokens=3,
+        sampling_params=NS(extra_args={DESCRIPTOR_KEY: other}),
+    )
+    advance(controller, requests)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    with pytest.raises(CompactionContractError):
+        controller.before_forward(metadata, positions, counts)
+    assert "f" not in controller.operations  # refused before it was registered
+    with pytest.raises(CompactionContractError, match="Unknown operation"):
+        controller.disarm("f")

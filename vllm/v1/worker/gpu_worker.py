@@ -1231,6 +1231,14 @@ class Worker(WorkerBase):
         """Return the last request receipt and disarm its compaction operation."""
         return self._cc_controller().result()
 
+    def cc_disarm(self, operation_id: str | None = None) -> dict:
+        """Close an armed operation that never bound (admission failed after arming).
+
+        Refused for a bound, live operation; ``operation_id=None`` addresses the
+        ``cc_arm`` operation, a string a descriptor operation.
+        """
+        return self._cc_controller().disarm(operation_id)
+
     def cc_set_prompt_logprob_rows(self, rows: int) -> dict:
         """Set the prompt-logprob projection chunk (rows of hidden states per GEMM).
 

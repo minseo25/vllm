@@ -1403,6 +1403,52 @@ class NativeCompactionController:
             self._retire(key, self.operations[key])
         return receipts
 
+    def disarm(self, operation_id: str | None = None) -> dict:
+        """Close an armed operation that never bound to a request.
+
+        Admission can fail after ``cc_arm``; the operation then never sees a
+        forward, ``result()`` keeps raising "boundary was not reached" and the
+        next ``cc_arm`` is refused although the engine is idle. Disarming closes
+        such an operation (and a failed one) and drops the export reservation it
+        opened, which holds no rows. A bound, live operation is refused: it must
+        finish through ``cc_result``/``cc_results``.
+        """
+        if operation_id is None:
+            operation = self.operation
+            if operation is None or operation.closed:
+                raise CompactionContractError("No armed operation to disarm")
+        else:
+            operation = self.operations.get(operation_id)
+            if operation is None:
+                raise CompactionContractError(f"Unknown operation: {operation_id}")
+        bound = operation.request_id is not None
+        if bound and not operation.failed and not operation.closed:
+            raise CompactionContractError(
+                "Cannot disarm a bound live operation; finish it through "
+                "cc_result/cc_results"
+            )
+        operation.closed = True
+        export_dropped = False
+        if operation.export_q is not None and self.q_store is not None:
+            name = operation.export_q["name"]
+            entries = self.q_store.list()["exports"]
+            if name in entries and entries[name]["rows_exported"] == 0:
+                self.q_store.drop(name)
+                export_dropped = True
+        if operation_id is not None:
+            self._retire(operation_id, operation)
+        return {
+            "disarmed": True,
+            "operation_id": operation_id,
+            "legacy": operation_id is None,
+            "never_bound": not bound,
+            "expected_request_id": operation.expected_request_id,
+            "failed": operation.failed,
+            "export_q": operation.export_q,
+            "export_dropped": export_dropped,
+            "forward_calls": len(operation.chunks),
+        }
+
     def _retire(self, key: str, operation: BoundaryOperation) -> None:
         self.operations.pop(key, None)
         request_id = operation.request_id or operation.expected_request_id
