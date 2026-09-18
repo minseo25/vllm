@@ -3994,6 +3994,17 @@ class GPUModelRunner(
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
 
+        # Native compaction query export copies rows to the host inside the
+        # attention op; a one-token exported slice looks like uniform decode and
+        # would dispatch FULL, which the controller refuses. Inspection only
+        # (no binding); capture supplies force_uniform_decode and skips it.
+        compaction = getattr(self, "compaction", None)
+        has_query_export = (
+            force_uniform_decode is None
+            and compaction is not None
+            and compaction.requires_query_export(num_reqs, num_scheduled_tokens_np)
+        )
+
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
@@ -4002,7 +4013,7 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL}
-                if disable_full or has_fresh_mamba_prefill
+                if disable_full or has_fresh_mamba_prefill or has_query_export
                 else None,
             )
 

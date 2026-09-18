@@ -1067,8 +1067,39 @@ AM_SUMMARY_KEYS = (
     "value_norm_ratio",
     "condition_estimate",
     "value_guard_rounds",
+    "max_fit_workspace_bytes",
+    "fit_workspace_admission",
     "warnings",
 )
+
+
+def fit_workspace_capacity(device: Any) -> dict:
+    """Admission capacity for the AM fit workspace (``max_fit_workspace_bytes``).
+
+    On CUDA: driver-free memory plus the allocator's cached-but-unallocated
+    reserve, sampled when called (the caller does so with the layer's inputs
+    already on the device). On CPU: ``None`` (no admission limit). The library
+    compares its lower bound of unavoidable new tensors against this; passing
+    does not certify the peak (Codex R1).
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return {
+            "bytes": None,
+            "policy": "cpu_no_limit",
+            "free_bytes": None,
+            "allocator_cached_bytes": None,
+        }
+    free, _total = torch.cuda.mem_get_info(device)
+    cached = max(
+        0, torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    )
+    return {
+        "bytes": int(free) + int(cached),
+        "policy": "device_free_plus_allocator_cached",
+        "free_bytes": int(free),
+        "allocator_cached_bytes": int(cached),
+    }
 
 
 def fit_am_layer(
@@ -1082,6 +1113,7 @@ def fit_am_layer(
     scale: float,
     params: dict,
     budget_bytes: dict | None = None,
+    max_fit_workspace_bytes: int | None = None,
 ) -> dict:
     """Call ``am.compact`` (no bias, uniform head budget) for one layer.
 
@@ -1135,6 +1167,7 @@ def fit_am_layer(
         fixed=list(fixed),
         scale=scale,
         ridge=ridge,
+        max_fit_workspace_bytes=max_fit_workspace_bytes,
         **blocking,
     )
     if getattr(result, "beta", None) is not None:

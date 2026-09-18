@@ -551,6 +551,73 @@ class EngineCore:
             "cuda_pool_deallocated": False,
         }
 
+    def abort_compaction_session(self, session_id: str) -> dict[str, Any]:
+        """Abort a native reader session in any state and confirm its removal.
+
+        Exception cleanup counterpart of ``release_compaction_session``, which
+        needs a quiescent completed chunk: this aborts queued, running or
+        completed chunks alike, frees the session's blocks (or defers them to
+        the in-flight step when the scheduler defers frees) and fails loudly if
+        the scheduler still knows the session afterwards.
+        """
+        if getattr(self, "_compaction_session_enabled", False) is not True:
+            raise RuntimeError("Install native compaction with cc_install first")
+        scheduler = self.scheduler
+        request = scheduler.requests.get(session_id)
+        if request is None:
+            raise ValueError("Unknown native compaction session")
+        params = request.sampling_params
+        if params is None or not (params.extra_args or {}).get(
+            "native_compaction_session"
+        ):
+            raise ValueError("Request is not a native compaction session")
+        pool = scheduler.kv_cache_manager.block_pool
+        free_before = pool.get_num_free_blocks()
+        status_before = request.status.name
+        blocks = scheduler.kv_cache_manager.get_blocks(session_id)
+        owned = sorted(
+            {
+                block.block_id
+                for group in blocks.blocks
+                for block in group
+                if not block.is_null
+            }
+        )
+        deferred_before = sum(
+            len(entry[1]) for entry in getattr(scheduler, "deferred_frees", ())
+        )
+        aborted = scheduler.finish_requests(
+            [session_id], RequestStatus.FINISHED_ABORTED
+        )
+        if [r.request_id for r in aborted] != [session_id] or (
+            session_id in scheduler.requests
+        ):
+            raise RuntimeError(
+                "Compaction abort did not remove the session from the scheduler"
+            )
+        deferred_after = sum(
+            len(entry[1]) for entry in getattr(scheduler, "deferred_frees", ())
+        )
+        after = self.compaction_status(None)
+        freed_now = after["free_blocks"] - free_before
+        deferred = deferred_after - deferred_before
+        if freed_now + deferred != len(owned):
+            raise RuntimeError(
+                f"Compaction abort freed {freed_now} blocks now and deferred "
+                f"{deferred}, but the session owned {len(owned)}"
+            )
+        return {
+            "session_id": session_id,
+            "status_before": status_before,
+            "after": after,
+            "owned_block_ids": owned,
+            "freed_block_count_now": freed_now,
+            "deferred_block_frees": deferred,
+            "scheduler_removed": True,
+            "worker_cleanup_on_next_step": True,
+            "cuda_pool_deallocated": False,
+        }
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 

@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import numpy as np
 import pytest
 import torch
 
@@ -828,7 +829,9 @@ class FakeSelect:
 class FakeAMResult:
     """Mirrors ``compaction_methods.am.AMResult`` for the shared case."""
 
-    def __init__(self, chosen, k, v, fixed, *, chunk, budget):
+    def __init__(
+        self, chosen, k, v, fixed, *, chunk, budget, max_fit_workspace_bytes=None
+    ):
         index = torch.tensor(chosen)
         heads = k.shape[1]
         self.indices = index[None, :].repeat(heads, 1)  # [Hkv, t]
@@ -855,6 +858,16 @@ class FakeAMResult:
             "chunk": chunk,
             "identity_shortcut": budget == k.shape[0],
             "output_error_after_rel": [0.0] * heads,
+            "max_fit_workspace_bytes": max_fit_workspace_bytes,
+            "fit_workspace_admission": (
+                None
+                if budget == k.shape[0]
+                else {
+                    "additional_live_tensor_lower_bound_bytes": 8 * budget * budget,
+                    "checked_capacity_bytes": max_fit_workspace_bytes,
+                    "scope": "lower_bound_only_not_peak_certification",
+                }
+            ),
             "warnings": [],
         }
 
@@ -887,6 +900,7 @@ class FakeAM:
         ridge,
         chunk=2048,
         memory_budget_bytes=None,
+        max_fit_workspace_bytes=None,
     ):
         self.calls.append(
             dict(
@@ -899,6 +913,7 @@ class FakeAM:
                 ridge=ridge,
                 chunk=chunk,
                 memory_budget_bytes=memory_budget_bytes,
+                max_fit_workspace_bytes=max_fit_workspace_bytes,
                 v_dtype=v.dtype,
             )
         )
@@ -909,7 +924,13 @@ class FakeAM:
             if i not in chosen:
                 chosen.append(i)
         return FakeAMResult(
-            sorted(chosen), k, v, list(fixed), chunk=chunk, budget=budget
+            sorted(chosen),
+            k,
+            v,
+            list(fixed),
+            chunk=chunk,
+            budget=budget,
+            max_fit_workspace_bytes=max_fit_workspace_bytes,
         )
 
 
@@ -1384,6 +1405,15 @@ def test_kv_fit_am_freezes_frame_tokens_and_records_fit_metadata(fakes):
     assert (call["budget"], call["ridge"], call["bias"]) == (3, 0.1, False)
     assert (call["scale"], call["memory_budget_bytes"]) == (HEAD**-0.5, 1 << 30)
     assert call["v_dtype"] == torch.float32
+    assert call["max_fit_workspace_bytes"] is None  # CPU: no admission limit
+    for name in FA:
+        workspace = params["fit_workspace"][name]
+        assert workspace["capacity"]["policy"] == "cpu_no_limit"
+        assert workspace["capacity"]["bytes"] is None
+        assert (
+            workspace["admission"]["scope"] == "lower_bound_only_not_peak_certification"
+        )
+        assert workspace["admission"]["checked_capacity_bytes"] is None
     rows = controller.kv_store.snapshot_rows("AM")
     for name in FA:
         source = cache_rows(layers[name], [1, 4, 5])
@@ -1714,6 +1744,7 @@ def test_real_methods_library_contract_on_tiny_tensors():
         "am_rmskeys_ols_nobias_uniform_offpolicy_framefixed"
     )
     assert full["method"]["params"]["identity_shortcut"] == {name: True for name in FA}
+    assert full["method"]["params"]["fit_workspace"]["fa0"]["admission"] is None
     assert (
         full["method"]["params"]["solver"]
         and full["method"]["params"]["accumulate_dtype"]
@@ -1737,6 +1768,9 @@ def test_real_methods_library_contract_on_tiny_tensors():
         protected=[0],
     )
     assert partial["method"]["params"]["frame_policy"] == "fixed"
+    admission = partial["method"]["params"]["fit_workspace"]["fa0"]["admission"]
+    assert admission["scope"] == "lower_bound_only_not_peak_certification"
+    assert admission["gram_width"] == 2 and admission["checked_capacity_bytes"] is None
     assert partial["method"]["params"]["fixed_tokens"] == {name: [0] for name in FA}
     for name in FA:
         stored = controller.kv_store.snapshot_rows("AM2")[name]
@@ -2244,3 +2278,84 @@ def test_repeat_prompt_is_forwarded_verbatim_for_kvzip_only(fakes):
             expected_cursor=CTX,
             params={"repeat_prompt": ""},
         )
+
+
+# ------------------------------------------------------- Codex M2 / R1 units
+
+
+def test_fit_workspace_admission_rejection_surfaces_as_a_contract_error(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+
+    def refuse(q_ref, k, v, budget, **kwargs):
+        raise RuntimeError(
+            "AM fit needs at least 5497390368 additional bytes, but admission "
+            "capacity is 4096; query chunking cannot remove this floor"
+        )
+
+    compaction_q.register_methods(am=NS(compact=refuse))
+    with pytest.raises(CompactionContractError, match="AM fit needs at least") as info:
+        controller.kv_fit_am(
+            "AM", q_export="Q", budget_tokens=2, request_id="ctx", expected_cursor=CTX
+        )
+    assert "am.compact failed" in str(info.value)
+    assert controller.kv_store.list()["snapshots"] == {}
+    assert compaction_q.fit_workspace_capacity(torch.device("cpu")) == {
+        "bytes": None,
+        "policy": "cpu_no_limit",
+        "free_bytes": None,
+        "allocator_cached_bytes": None,
+    }
+
+
+def test_requires_query_export_inspects_rows_without_binding_or_allocating():
+    desc = dict(
+        operation_id="e",
+        expected_prompt_tokens=5,
+        start_cursor=4,
+        export_q={"name": "Q", "token_range": [4, 5]},
+    )
+    requests = [("dec", 10, 1, None, 3), ("flag", 4, 1, desc, 2)]
+    controller, layers, _ = make_controller(requests)
+    counts = np.array([1, 1])
+    assert controller.requires_query_export(2, counts) is True
+    # Inspection has no side effects: nothing bound, seen or allocated.
+    assert controller.operations == {} and controller._seen_operation_ids == set()
+    assert controller.q_exports()["exports"] == {}
+    # Only the decode row: no export in this forward.
+    assert controller.requires_query_export(1, counts) is False
+    # Row outside its range (range already exported).
+    advance(controller, [("dec", 10, 1, None, 3), ("flag", 5, 1, desc, 2)])
+    assert controller.requires_query_export(2, counts) is False
+    # Malformed descriptor fields are ignored here (validated at the forward).
+    advance(controller, [("dec", 10, 1, None, 3), ("flag", 4, 1, desc, 2)])
+    controller.runner.requests["flag"].sampling_params.extra_args[DESCRIPTOR_KEY] = {
+        **desc,
+        "export_q": {"name": "Q", "token_range": [4]},
+    }
+    assert controller.requires_query_export(2, counts) is False
+    controller.runner.requests["flag"].sampling_params.extra_args[DESCRIPTOR_KEY] = {
+        **desc,
+        "operation_id": 7,
+    }
+    assert controller.requires_query_export(2, counts) is False
+    controller.runner.requests["flag"].sampling_params.extra_args[DESCRIPTOR_KEY] = desc
+    # A bound, open operation is inspected through its export_q; closed ones are not.
+    metadata, positions, counts_map = forward_inputs(requests, controller)
+    boundary = controller.before_forward(metadata, positions, counts_map)
+    assert controller.requires_query_export(2, counts) is True
+    run_attention(layers, query_batch(2), metadata)
+    controller.after_forward(boundary)
+    controller.results(["e"])
+    assert controller.requires_query_export(2, counts) is False
+    # Legacy arm: bound to the single request without a descriptor.
+    plain = [("r", 4, 1, None, 2)]
+    controller, layers, _ = make_controller(plain)
+    controller.arm(
+        expected_prompt_tokens=5,
+        start_cursor=4,
+        export_q={"name": "L", "token_range": [4, 5]},
+    )
+    assert controller.requires_query_export(1, np.array([1])) is True
+    controller.operation.closed = True
+    assert controller.requires_query_export(1, np.array([1])) is False

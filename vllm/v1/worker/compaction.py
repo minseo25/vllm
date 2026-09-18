@@ -1236,6 +1236,54 @@ class NativeCompactionController:
             operation_id=operation_id,
         )
 
+    def requires_query_export(self, num_reqs: int, scheduled_tokens: Any) -> bool:
+        """Does this forward carry rows of an active query-export range?
+
+        Inspection only, for cudagraph dispatch: no operation is bound, no
+        export buffer is allocated and no state changes. A one-token slice
+        inside an export range would otherwise be classified as uniform decode
+        and dispatched FULL, which the forward-time guard then refuses.
+        Malformed descriptors are ignored here; normal validation rejects them.
+        """
+        batch = self.runner.input_batch
+        for row, request_id in enumerate(batch.req_ids[:num_reqs]):
+            request = self.runner.requests[request_id]
+            params = getattr(request, "sampling_params", None)
+            descriptor = (getattr(params, "extra_args", None) or {}).get(DESCRIPTOR_KEY)
+            export = None
+            if descriptor is None:
+                operation = self.operation
+                if (
+                    operation is not None
+                    and not operation.closed
+                    and operation.expected_request_id in (None, request_id)
+                ):
+                    export = operation.export_q
+            elif isinstance(descriptor, dict):
+                operation_id = descriptor.get("operation_id")
+                if not isinstance(operation_id, str):
+                    continue
+                operation = self.operations.get(operation_id)
+                if operation is not None:
+                    if not operation.closed:
+                        export = operation.export_q
+                elif operation_id not in self._seen_operation_ids:
+                    export = descriptor.get("export_q")
+            if not isinstance(export, dict):
+                continue
+            span = export.get("token_range")
+            if (
+                not isinstance(span, (list, tuple))
+                or len(span) != 2
+                or any(type(value) is not int for value in span)
+            ):
+                continue
+            computed = int(batch.num_computed_tokens_cpu[row])
+            count = int(scheduled_tokens[row])
+            if computed < span[1] and computed + count > span[0]:
+                return True
+        return False
+
     def _bound_operation(
         self, request_id: str, request: Any
     ) -> BoundaryOperation | None:
@@ -2570,7 +2618,7 @@ class NativeCompactionController:
         synthetic, layer_tokens, kv_digests = {}, {}, {}
         casts, variants, diagnostics, summaries, scales = set(), set(), {}, {}, {}
         cast_errors, output_errors, blockings, fixed_positions = {}, {}, {}, {}
-        library_warnings = {}
+        library_warnings, fit_workspace = {}, {}
         for name, kv_rows, indices in rows():
             layer = self.kv_store.layers[name]
             keys, values = compaction_q.split_kv(kv_rows, layer.head_size)
@@ -2584,6 +2632,8 @@ class NativeCompactionController:
             positions = [position_of[t] for t in protected_tokens]
             fixed, refit = ([], positions) if refit_protected else (positions, [])
             q_ref = q_tensors[name].to(keys.device)
+            # Fit admission (Codex R1): sampled with this layer's inputs on device.
+            capacity = compaction_q.fit_workspace_capacity(keys.device)
             fit = compaction_q.fit_am_layer(
                 q_ref=q_ref,
                 k=keys,
@@ -2594,7 +2644,12 @@ class NativeCompactionController:
                 scale=scales[name],
                 params=params,
                 budget_bytes=budget,
+                max_fit_workspace_bytes=capacity["bytes"],
             )
+            fit_workspace[name] = {
+                "capacity": capacity,
+                "admission": fit["summary"].get("fit_workspace_admission"),
+            }
             fitted32 = fit["v_c"].to(device=keys.device)
             fitted = fitted32.to(dtype=values.dtype)
             casts.add(f"{fitted32.dtype}->{values.dtype}")
@@ -2682,6 +2737,7 @@ class NativeCompactionController:
                 },
                 "warnings": {n: s.get("warnings") for n, s in summaries.items()},
                 "library_warnings": library_warnings,
+                "fit_workspace": fit_workspace,
             },
             "inputs": {
                 "q_export": q_export,

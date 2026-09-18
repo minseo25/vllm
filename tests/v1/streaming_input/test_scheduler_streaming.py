@@ -796,3 +796,96 @@ class TestStreamingScheduler(unittest.TestCase):
             cached_state_cycle1["prompt_token_ids"]
             is not cached_state_cycle3["prompt_token_ids"]
         ), "Cached states from different cycles should be independent objects."
+
+
+# --------------------------------------------- native session abort (Codex M3)
+
+
+def test_abort_compaction_session_removes_ownership_in_any_state():
+    engine, core = create_compaction_engine()
+    pool = core.scheduler.kv_cache_manager.block_pool
+    idle_free = pool.get_num_free_blocks()
+    # (a) mid-chunk: scheduled but never completed (an exception during the step).
+    session_id = engine.add_compaction_input([1, 2, 3])
+    scheduled = core.scheduler.schedule()
+    assert list(scheduled.num_scheduled_tokens) == [session_id]
+    with pytest.raises(RuntimeError, match="Consume the current chunk"):
+        engine.release_compaction_session(session_id)  # normal release cannot clean
+    receipt = engine.abort_compaction_session(session_id)
+    assert receipt["core"]["status_before"] == "RUNNING"
+    assert receipt["core"]["freed_block_count_now"] == len(
+        receipt["core"]["owned_block_ids"]
+    )
+    assert receipt["core"]["deferred_block_frees"] == 0
+    assert receipt["frontend_removed"] and receipt["session_id_removed"]
+    assert receipt["engine_idle"] and receipt["core_status"]["idle"]
+    assert session_id not in core.scheduler.requests
+    assert session_id not in engine._compaction_session_ids
+    assert session_id not in engine.output_processor.request_states
+    assert pool.get_num_free_blocks() == idle_free
+    status = engine.compaction_status(None)
+    assert status["engine_idle"] and status["frontend_sessions"] == []
+    assert status["frontend_unfinished_requests"] is False
+    with pytest.raises(ValueError, match="Unknown native compaction session"):
+        engine.abort_compaction_session(session_id)
+    # (b) a completed, quiescent chunk aborts the same way.
+    session_id = engine.add_compaction_input([1, 2, 3])
+    complete_compaction_chunk(engine, core)
+    receipt = engine.abort_compaction_session(session_id)
+    assert receipt["core"]["status_before"] == "WAITING_FOR_STREAMING_REQ"
+    assert engine.compaction_status(None)["engine_idle"]
+    assert pool.get_num_free_blocks() == idle_free
+    # (c) the engine admits a fresh session afterwards.
+    fresh = engine.add_compaction_input([7, 8])
+    assert fresh in core.scheduler.requests and fresh != session_id
+
+
+def test_abort_compaction_session_after_the_core_dropped_it_cleans_the_frontend():
+    engine, core = create_compaction_engine()
+    session_id = engine.add_compaction_input([1, 2, 3])
+    complete_compaction_chunk(engine, core)
+    # A failed step may abort the core request while the frontend still owns
+    # the id: abort_request(internal=True) alone does not release ownership.
+    core.abort_requests([session_id])
+    assert session_id not in core.scheduler.requests
+    assert session_id in engine._compaction_session_ids
+    receipt = engine.abort_compaction_session(session_id)
+    assert "already_absent" in receipt["core"]
+    assert receipt["frontend_removed"] and receipt["engine_idle"]
+    assert engine._compaction_session_ids == set()
+    assert engine.compaction_status(None)["engine_idle"]
+
+
+def test_abort_compaction_session_refuses_foreign_requests_and_keeps_others():
+    engine, core = create_compaction_engine()
+    core.scheduler.max_num_running_reqs = 32
+    session_id = engine.add_compaction_input([1, 2, 3])
+    complete_compaction_chunk(engine, core)
+    core.scheduler.add_request(DummyRequest("other", prompt_token_ids=[4, 5]))
+    with pytest.raises(ValueError, match="not a native compaction session"):
+        core.abort_compaction_session("other")
+    status = engine.compaction_status(None)
+    assert not status["engine_idle"] and status["request_count"] == 2
+    receipt = engine.abort_compaction_session(session_id)
+    assert receipt["core"]["scheduler_removed"] and not receipt["engine_idle"]
+    assert "other" in core.scheduler.requests
+    assert engine._compaction_session_ids == set()
+
+
+def test_frontend_compaction_status_none_reports_engine_idle_and_owned_sessions():
+    engine, core = create_compaction_engine()
+    assert engine.compaction_status(None)["engine_idle"]
+    session_id = engine.add_compaction_input([1, 2, 3])
+    status = engine.compaction_status(None)
+    assert status["idle"] is False and status["engine_idle"] is False
+    assert status["frontend_sessions"] == [session_id]
+    assert status["frontend_unfinished_requests"] is True
+    complete_compaction_chunk(engine, core)
+    status = engine.compaction_status(None)
+    assert status["engine_idle"] is False and status["frontend_sessions"] == [
+        session_id
+    ]
+    engine.release_compaction_session(session_id)
+    status = engine.compaction_status(None)
+    assert status["engine_idle"] and status["frontend_sessions"] == []
+    assert status["request_count"] == 0

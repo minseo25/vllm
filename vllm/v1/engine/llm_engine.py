@@ -309,10 +309,73 @@ class LLMEngine:
             raise RuntimeError("Consume the current chunk's finish output first")
         return state
 
-    def compaction_status(self, session_id: str) -> dict[str, Any]:
-        """Return quiescent native session cursor and actual block ownership."""
+    def compaction_status(self, session_id: str | None) -> dict[str, Any]:
+        """Return quiescent native session cursor and actual block ownership.
+
+        With ``session_id=None`` return the core's idle status plus the
+        frontend's view: ``frontend_sessions`` (ids this engine still owns),
+        ``frontend_unfinished_requests`` and ``engine_idle`` (core idle, no owned
+        sessions, no unfinished frontend requests) as one idle assertion.
+        """
+        if session_id is None:
+            status = self._compaction_utility("compaction_status", None)
+            unfinished = self.output_processor.has_unfinished_requests()
+            sessions = sorted(self._compaction_session_ids)
+            return {
+                **status,
+                "frontend_sessions": sessions,
+                "frontend_unfinished_requests": unfinished,
+                "engine_idle": bool(status["idle"]) and not sessions and not unfinished,
+            }
         self._compaction_frontend_state(session_id)
         return self._compaction_utility("compaction_status", session_id)
+
+    def abort_compaction_session(self, session_id: str) -> dict[str, Any]:
+        """Abort a session in any state, confirm cleanup, then forget its id.
+
+        ``release_compaction_session`` needs a completed, quiescent chunk and
+        cannot serve as exception cleanup; ``abort_request(internal=True)``
+        aborts work but leaves the session id owned. This path aborts the core
+        request (queued, running or completed), removes the frontend state even
+        mid-chunk, verifies the core no longer knows the session and no
+        unfinished frontend request remains for it, and only then removes the
+        id. A core cleanup failure propagates and keeps the id owned.
+        """
+        if session_id not in self._compaction_session_ids:
+            raise ValueError("Unknown native compaction session")
+        core: dict[str, Any]
+        try:
+            core = self._compaction_utility("abort_compaction_session", session_id)
+        except ValueError as error:
+            # The core already finished/aborted it (for example on a failed
+            # step); the frontend and the id still need cleaning.
+            core = {"session_id": session_id, "already_absent": str(error)}
+        removed = self.output_processor.abort_requests([session_id], internal=True)
+        if session_id in self.output_processor.request_states:
+            raise RuntimeError("Compaction abort left the frontend request state")
+        try:
+            self._compaction_utility("compaction_status", session_id)
+        except ValueError:
+            pass  # unknown to the core: the session is gone
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Compaction abort left the core session resident"
+            ) from error
+        else:
+            raise RuntimeError("Compaction abort left the core session resident")
+        status = self._compaction_utility("compaction_status", None)
+        self._compaction_session_ids.remove(session_id)
+        return {
+            "session_id": session_id,
+            "core": core,
+            "frontend_removed": removed == [session_id],
+            "frontend_state_absent": True,
+            "core_status": status,
+            "session_id_removed": True,
+            "engine_idle": bool(status["idle"])
+            and not self._compaction_session_ids
+            and not self.output_processor.has_unfinished_requests(),
+        }
 
     def release_compaction_session(self, session_id: str) -> dict[str, Any]:
         """Release a quiescent session's scheduler blocks and frontend state."""
