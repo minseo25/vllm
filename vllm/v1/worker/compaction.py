@@ -1060,6 +1060,15 @@ class NativeCompactionController:
                 "kv_select",
                 "kv_fit_am",
             ],
+            "store_ops": [
+                "kv_subset",
+                "kv_selection_drop",
+                "kv_describe",
+                "q_describe",
+                "kv_drop",
+                "q_drop",
+                "score_drop",
+            ],
             "consumed_cursor_tracking": "controller_tracked_expected_cursor_required",
             "scope": "native_per_request_boundary_intervention",
         }

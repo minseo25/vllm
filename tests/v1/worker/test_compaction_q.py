@@ -312,6 +312,29 @@ def test_mixed_batch_exports_only_the_flagged_requests_rows_for_every_layer():
     assert receipt["export_q"] == {"name": "Q", "token_range": [1, 3]}
     assert receipt["q_export_chunks"][0]["rows"] == 2
     assert receipt["query_export"] and "kv_score" in receipt["compute_ops"]
+    assert receipt["compute_ops"] == [
+        "kv_capture",
+        "kv_subset",
+        "kv_score",
+        "kv_select",
+        "kv_fit_am",
+    ]
+    assert (
+        receipt["store_ops"]
+        == controller.info()["store_ops"]
+        == [
+            "kv_subset",
+            "kv_selection_drop",
+            "kv_describe",
+            "q_describe",
+            "kv_drop",
+            "q_drop",
+            "score_drop",
+        ]
+    )
+    # Every advertised op is a real controller method.
+    for name in receipt["compute_ops"] + receipt["store_ops"]:
+        assert callable(getattr(controller, name))
 
 
 def test_padded_hook_call_exports_only_the_real_rows():
