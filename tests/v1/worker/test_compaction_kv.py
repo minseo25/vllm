@@ -639,17 +639,28 @@ def test_bias_buffer_layout_mismatch_is_rejected_before_any_write():
     store, layers, metadata = bias_store()
     layers["b"].bias_cache = torch.zeros(8, 2, 4, dtype=torch.bfloat16)
     tensors = {name: torch.full((3, 2, 6), 4.0) for name in layers}
+    receipt = store.register(
+        "fit",
+        tensors,
+        source_cursor=10,
+        source_position_offset=0,
+        retained_tokens=3,
+        method=method_record(),
+        beta=beta_rows(layers),
+    )
+    assert receipt["has_bias"] is True
+    # A malformed buffer is a fault, reported loudly rather than as "no bias".
     with pytest.raises(ValueError, match="bias_cache must be float32.*: b"):
-        store.register(
-            "fit",
-            tensors,
-            source_cursor=10,
-            source_position_offset=0,
-            retained_tokens=3,
-            method=method_record(),
-            beta=beta_rows(layers),
-        )
+        store.bias_supported()
+    before_kv = {name: layer.kv_cache.clone() for name, layer in layers.items()}
+    before_bias = {name: layer.bias_cache.clone() for name, layer in layers.items()}
+    with pytest.raises(ValueError, match="bias_cache must be float32.*: b"):
+        store.validate_restore("fit", "target", 1, metadata, 3)
+    with pytest.raises(ValueError, match="bias_cache must be float32.*: b"):
         store.restore("fit", "target", 1, metadata, 3)
+    for name, layer in layers.items():
+        assert torch.equal(layer.kv_cache, before_kv[name])
+        assert torch.equal(layer.bias_cache, before_bias[name])
 
 
 def test_block_reused_after_an_import_reads_zero_bias():

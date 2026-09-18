@@ -2685,8 +2685,9 @@ class NativeCompactionController:
         and registers it beside the rows as float32 ``[t, num_kv_heads]`` per
         layer (frame rows 0); it needs every FA layer to carry a paged bias
         buffer (Triton attention backend, ``info()['compute_ops']`` lists
-        ``kv_bias``) and is refused otherwise. ``iters`` and per-head budgets stay
-        refused. Resident sources require ``expected_cursor``.
+        ``kv_bias``) and is refused otherwise. ``mass_weighting`` without
+        ``bias=True``, ``iters`` and per-head budgets are refused. Resident
+        sources require ``expected_cursor``.
         """
         compaction_q = _q_module()
         params = compaction_q._check_params(
@@ -2705,9 +2706,11 @@ class NativeCompactionController:
             "am",
         )
         bias = params.get("bias", False)
-        mass_weighting = params.get("mass_weighting", "uniform")
         if not isinstance(bias, bool):
             raise CompactionContractError("bias must be a bool")
+        if "mass_weighting" in params and bias is not True:
+            raise CompactionContractError("mass_weighting requires bias=True")
+        mass_weighting = params.get("mass_weighting", "uniform")
         if mass_weighting not in ("uniform", "shifted"):
             raise CompactionContractError(
                 "mass_weighting must be 'uniform' or 'shifted'"

@@ -788,13 +788,36 @@ def _check_enough_kv_cache_memory(
         )
 
 
+def kv_bias_max_memory_usage_bytes(vllm_config: VllmConfig, spec: KVCacheSpec) -> int:
+    """Fork: bytes of ``spec``'s per-key bias buffer for one max-length request.
+
+    One bias block per KV page the request needs; zero unless the spec (or, for
+    ``UniformTypeKVCacheSpecs``, one of its per-layer specs) carries ``kv_bias``.
+    """
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return sum(
+            kv_bias_max_memory_usage_bytes(vllm_config, layer_spec)
+            for layer_spec in spec.kv_cache_specs.values()
+        )
+    bias_per_block = getattr(spec, "kv_bias_bytes_per_block", 0)
+    if not bias_per_block:
+        return 0
+    pages = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+    return pages * bias_per_block
+
+
 def max_memory_usage_bytes(
     vllm_config: VllmConfig, kv_cache_specs: Iterable[KVCacheSpec]
 ) -> int:
     """
-    Get the maximum memory usage in bytes for the given KV cache specs.
+    Get the maximum memory usage in bytes for the given KV cache specs
+    (including the per-key bias buffers of layers that carry one).
     """
-    return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
+    return sum(
+        spec.max_memory_usage_bytes(vllm_config)
+        + kv_bias_max_memory_usage_bytes(vllm_config, spec)
+        for spec in kv_cache_specs
+    )
 
 
 def estimate_max_model_len(
@@ -978,16 +1001,19 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
+    # Fork: the per-key bias buffers are charged per block against the same
+    # budget, so they belong to the effective bytes per block here too.
+    bias_bytes = kv_bias_bytes_per_block(kv_cache_groups)
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
-        return kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        return kv_cache_groups[0].kv_cache_spec.page_size_bytes + bias_bytes
     if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
-        return block_stride
+        return block_stride + bias_bytes
     group_size = max(len(g.layer_names) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
-    return page_size * group_size
+    return page_size * group_size + bias_bytes
 
 
 def get_num_blocks(
@@ -1330,8 +1356,8 @@ def _use_packed_kv_cache_config(
 def kv_bias_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     """Fork: per-block bytes of the per-key bias buffers over every layer.
 
-    A layer whose ``AttentionSpec.kv_bias`` is set keeps a float32
-    ``[num_blocks, num_kv_heads, block_size]`` buffer beside its pages (see
+    A layer whose ``AttentionSpec.kv_bias`` is set keeps a separate float32
+    ``[num_blocks, num_kv_heads, block_size]`` buffer next to its pages (see
     ``vllm.v1.worker.kv_bias``); ``num_blocks`` must be sized so that the pages
     and these buffers together fit the KV budget. Zero for every other model.
     """
@@ -1355,6 +1381,7 @@ def kv_memory_after_bias_reservation(
 ) -> int:
     """Fork: the KV budget that leaves room for the per-key bias buffers.
 
+    The buffers are separate allocations charged against the same budget:
     ``num_blocks = result // kv_bytes_per_block == available // (kv + bias)``,
     so ``num_blocks * (kv_bytes_per_block + bias_bytes_per_block) <= available``.
     Unchanged when no layer carries a bias buffer.
@@ -1366,13 +1393,14 @@ def kv_memory_after_bias_reservation(
         * kv_bytes_per_block
         // (kv_bytes_per_block + bias_bytes_per_block)
     )
-    logger.info_once(
-        "Reserving %s GiB of the KV cache budget for per-key attention bias "
-        "buffers (%d bytes per block beside %d KV bytes per block).",
-        format_gib(available_memory - reserved),
-        bias_bytes_per_block,
-        kv_bytes_per_block,
-    )
+    if available_memory > 0:
+        logger.info_once(
+            "Reserving %s GiB of the KV cache budget for per-key attention bias "
+            "buffers (%d bytes per block beside %d KV bytes per block).",
+            format_gib(available_memory - reserved),
+            bias_bytes_per_block,
+            kv_bytes_per_block,
+        )
     return reserved
 
 
@@ -1555,6 +1583,8 @@ def _promote_local_kv_cache_specs(
                     head_size=spec.head_size,
                     dtype=spec.dtype,
                     page_size_padded=promoted_page_size_padded(spec, block_size),
+                    indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride,
+                    kv_bias=spec.kv_bias,
                     cache_dtype_str=spec.cache_dtype_str,
                     alignment=spec.alignment,
                     compress_ratio=spec.compress_ratio,
@@ -1571,6 +1601,8 @@ def _promote_local_kv_cache_specs(
                     kv_quant_mode=spec.kv_quant_mode,
                     sliding_window=spec.sliding_window,
                     page_size_padded=promoted_page_size_padded(spec, block_size),
+                    indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride,
+                    kv_bias=spec.kv_bias,
                 )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
                 block_size = full_attention_block_size or spec.block_size
@@ -1581,6 +1613,8 @@ def _promote_local_kv_cache_specs(
                     dtype=spec.dtype,
                     attention_chunk_size=spec.attention_chunk_size,
                     page_size_padded=promoted_page_size_padded(spec, block_size),
+                    indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride,
+                    kv_bias=spec.kv_bias,
                 )
 
     if not (
@@ -1969,6 +2003,7 @@ def _max_memory_usage_bytes_from_groups(
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         return sum(
             spec.max_memory_usage_bytes(vllm_config)
+            + kv_bias_max_memory_usage_bytes(vllm_config, spec)
             for spec in per_layer_specs.values()
         )
     elif all(
@@ -1995,10 +2030,14 @@ def _max_memory_usage_bytes_from_groups(
                 num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
-        return total_max_mem_usage_bytes
+        return total_max_mem_usage_bytes + sum(
+            kv_bias_max_memory_usage_bytes(vllm_config, group.kv_cache_spec)
+            for group in kv_cache_groups
+        )
 
     # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
+    # Memory = group_size * page_size * blocks_for_max_len, plus the per-block
+    # bytes of the per-key bias buffers charged against the same budget (fork).
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
@@ -2008,7 +2047,9 @@ def _max_memory_usage_bytes_from_groups(
         for group in kv_cache_groups
     )
 
-    return group_size * page_size * blocks_needed
+    return blocks_needed * (
+        group_size * page_size + kv_bias_bytes_per_block(kv_cache_groups)
+    )
 
 
 def _estimate_max_model_len_from_groups(

@@ -14,14 +14,19 @@ Invariants:
   reset to zero in the same kernel launch, so a page reused by a later request
   never exposes a bias imported for an earlier one. Only the compaction store
   writes non-zero rows, at import, into exactly the slots it writes K/V to.
-* The buffers are allocated right after the KV cache, sized from each layer's
-  cache shape, and budgeted per block when the KV pool is sized
-  (``AttentionSpec.kv_bias`` -> ``kv_cache_utils.kv_bias_bytes_per_block``),
-  so pages plus bias buffers fit the ``gpu_memory_utilization`` budget.
-* Whether a layer gets a buffer follows only the resolved attention backend
+* Each buffer is a separate allocation, not part of the KV pages: it is
+  allocated right after the KV cache, sized from the layer's cache shape, and
+  its per-block bytes are charged against the KV budget when ``num_blocks`` is
+  chosen (``AttentionSpec.kv_bias`` -> ``kv_cache_utils.kv_bias_bytes_per_block``),
+  so pages plus buffers stay within ``gpu_memory_utilization``.
+* The KV cache config is the single source of truth for which layers carry a
+  buffer: the model runner flags a layer's spec (``kv_bias=True``) when its
+  resolved attention backend supports the bias
   (``AttentionBackend.supports_kv_bias``, today ``TRITON_ATTN``) and its KV
-  cache dtype; there is no environment switch. Running without buffers means
-  selecting another backend (``attention_backend="FLASH_ATTN"``).
+  cache is unquantized fp16/bf16/fp32; allocation follows the flagged specs and
+  fails if a flagged layer's backend cannot apply the bias. There is no
+  environment switch; running without buffers means selecting another backend
+  (``attention_backend="FLASH_ATTN"``).
 """
 
 from __future__ import annotations
@@ -30,8 +35,16 @@ from typing import Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVQuantMode,
+    UniformTypeKVCacheSpecs,
+    get_kv_quant_mode,
+)
+
+logger = init_logger(__name__)
 
 KV_BIAS_DTYPE = torch.float32
 SUPPORTED_KV_CACHE_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
@@ -89,28 +102,65 @@ def bias_cache_of(layer: Any) -> torch.Tensor | None:
     return bias
 
 
+def kv_bias_layers(kv_cache_config: KVCacheConfig) -> set[str]:
+    """Layers whose group spec budgets a bias buffer (``AttentionSpec.kv_bias``)."""
+    flagged: set[str] = set()
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            flagged.update(
+                name
+                for name, layer_spec in spec.kv_cache_specs.items()
+                if getattr(layer_spec, "kv_bias", False)
+            )
+        elif getattr(spec, "kv_bias", False):
+            flagged.update(group.layer_names)
+    return flagged
+
+
 def allocate_kv_bias_caches(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, Any],
     shared_kv_cache_layers: dict[str, str],
     device: torch.device | str,
+    kv_cache_config: KVCacheConfig,
 ) -> dict[str, torch.Tensor]:
-    """Allocate zeroed bias buffers for every bias-capable attention layer.
+    """Allocate zeroed bias buffers for the layers the KV cache config budgets.
 
-    Sized from each layer's bound KV cache view (``shape[:3]`` of the logical
-    ``(B, H, N, C)`` cache), so the total is ``num_blocks *
-    kv_bias_bytes_per_block`` exactly as budgeted. Layers that share another
-    layer's KV cache share its bias buffer. Returns ``{layer_name: buffer}``.
+    The config's group specs (``kv_bias=True``) are the single source of truth,
+    the same flags ``kv_cache_utils`` charged per block when it chose
+    ``num_blocks``; a flagged layer whose backend cannot apply the bias is an
+    error (budget and allocation would diverge), an unflagged bias-capable
+    layer gets no buffer (and the store then reports the bias unsupported).
+    Each buffer is sized from the layer's bound KV cache view (``shape[:3]`` of
+    the logical ``(B, H, N, C)`` cache, kernel blocks), so the total is
+    ``num_blocks * kv_bias_bytes_per_block`` exactly as budgeted. Layers that
+    share another layer's KV cache share its buffer. Returns
+    ``{layer_name: buffer}``.
     """
+    flagged = kv_bias_layers(kv_cache_config)
     caches: dict[str, torch.Tensor] = {}
     for name, kv_cache in kv_caches.items():
         if name in shared_kv_cache_layers:
             continue
         layer = forward_context.get(name)
-        if layer is None or not layer_supports_kv_bias(layer):
+        if layer is None:
             continue
+        if name not in flagged:
+            if layer_supports_kv_bias(layer):
+                logger.warning_once(
+                    "Attention layer %s could apply a per-key bias but its KV "
+                    "cache spec budgets none; no bias buffer is allocated.",
+                    name,
+                )
+            continue
+        if not layer_supports_kv_bias(layer):
+            raise RuntimeError(
+                f"KV cache config budgets a per-key bias buffer for {name} but its "
+                "attention backend cannot apply one"
+            )
         if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim != 4:
-            continue
+            raise RuntimeError(f"KV bias needs a 4-D attention cache view: {name}")
         bias = torch.zeros(kv_bias_shape(kv_cache), dtype=KV_BIAS_DTYPE, device=device)
         layer.bias_cache = bias
         caches[name] = bias

@@ -5746,7 +5746,9 @@ class GPUModelRunner(
             # sampler and CPU accumulation (including full-vocabulary output).
             # Tunable at runtime (cc_set_prompt_logprob_rows) so a validation run
             # can compare chunked against single-projection scoring on real GEMMs.
-            max_logits_per_chunk = int(getattr(self, "prompt_logprobs_chunk_rows", 1024))
+            max_logits_per_chunk = int(
+                getattr(self, "prompt_logprobs_chunk_rows", 1024)
+            )
             for chunk_start in range(0, num_logits, max_logits_per_chunk):
                 chunk_end = min(chunk_start + max_logits_per_chunk, num_logits)
                 prompt_hidden_states = hidden_states[
@@ -6657,6 +6659,8 @@ class GPUModelRunner(
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
+        # Fork: per-key bias buffers follow the KV cache they were sized from.
+        self.kv_bias_caches = {}
 
         for layer in self.compilation_config.static_forward_context.values():
             if hasattr(layer, "kv_cache"):
@@ -6664,6 +6668,8 @@ class GPUModelRunner(
                 layer.kv_cache = (
                     torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
                 )
+            if getattr(layer, "bias_cache", None) is not None:
+                layer.bias_cache = None
             # Clean up quantized KV cache scale views
             # (int8_per_token_head, fp8_per_token_head)
             if hasattr(layer, "impl"):
@@ -7731,14 +7737,16 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
-        # Fork: zeroed float32 per-key bias buffers beside the pages of every
-        # bias-capable attention layer; budgeted per block by kv_cache_utils
-        # from the specs' ``kv_bias`` flag set in get_kv_cache_spec.
+        # Fork: separate zeroed float32 per-key bias buffers for the layers
+        # whose group spec carries ``kv_bias`` (set in get_kv_cache_spec from
+        # the resolved backend); kv_cache_utils charged them per block when it
+        # chose num_blocks, so the allocation follows the same flags.
         self.kv_bias_caches = allocate_kv_bias_caches(
             kv_caches,
             self.compilation_config.static_forward_context,
             self.shared_kv_cache_layers,
             self.device,
+            kv_cache_config,
         )
 
         if (
@@ -7914,7 +7922,7 @@ class GPUModelRunner(
                         indexes = backend.indexes_kv_by_block_stride()
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
                     if layer_supports_kv_bias(attn_module):
-                        # Fork: budget the per-key bias buffer beside each page.
+                        # Fork: charge the layer's per-key bias buffer per block.
                         spec = replace(spec, kv_bias=True)
                 kv_cache_spec[layer_name] = spec
 

@@ -1651,7 +1651,8 @@ def test_compute_ops_fail_closed_on_missing_library_and_bad_outputs(monkeypatch)
     # bias / mass_weighting are accepted names now (AM bias variant) but
     # still fail closed on malformed values and on a bias-less backend.
     for bad_params, message in (
-        ({"mass_weighting": "harmonic"}, "mass_weighting must be"),
+        ({"bias": True, "mass_weighting": "harmonic"}, "mass_weighting must be"),
+        ({"mass_weighting": "uniform"}, "requires bias=True"),
         ({"bias": 1}, "bias must be a bool"),
         ({"bias": True}, "cannot apply per-key bias"),
     ):
@@ -1952,18 +1953,28 @@ def test_kv_fit_am_bias_is_refused_before_any_fit_without_a_bias_buffer(fakes):
         )
     assert fakes.am.calls == []
     assert controller.kv_store.list()["snapshots"] == {}
-    # mass_weighting without bias is accepted and ignored (recorded verbatim).
-    receipt = controller.kv_fit_am(
-        "AM",
-        q_export="Q",
-        budget_tokens=3,
-        request_id="ctx",
-        expected_cursor=CTX,
-        params={"mass_weighting": "shifted"},
-    )
-    assert fakes.am.calls[0]["bias"] is False
-    assert fakes.am.calls[0]["mass_weighting"] is None
-    assert receipt["has_bias"] is False
+    # mass_weighting is a bias-only parameter: refused on the nobias row.
+    for params in ({"mass_weighting": "shifted"}, {"mass_weighting": "uniform"}):
+        with pytest.raises(CompactionContractError, match="requires bias=True"):
+            controller.kv_fit_am(
+                "AM",
+                q_export="Q",
+                budget_tokens=3,
+                request_id="ctx",
+                expected_cursor=CTX,
+                params=params,
+            )
+    with pytest.raises(CompactionContractError, match="requires bias=True"):
+        controller.kv_fit_am(
+            "AM",
+            q_export="Q",
+            budget_tokens=3,
+            request_id="ctx",
+            expected_cursor=CTX,
+            params={"bias": False, "mass_weighting": "uniform"},
+        )
+    assert fakes.am.calls == []
+    assert controller.kv_store.list()["snapshots"] == {}
 
 
 @pytest.mark.parametrize(
