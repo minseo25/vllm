@@ -965,8 +965,10 @@ def test_kv_and_state_import_share_boundary_and_original_query_positions(wrong_o
     assert result["kv_capture"]["digest"] == source["digest"]
     assert result["kv_capture"]["source_position_offset"] == 4
     assert result["kv_restore"]["query_position_offset"] == 4
-    with pytest.raises(ValueError, match="Repeated selected-KV"):
-        kv_store.validate_restore("roundtrip", "second-retention", 0, metadata, 2)
+    # An offset source is importable again (chained import); the controller
+    # checks the continuation offset, see the chained-import test below.
+    kv_store.validate_restore("roundtrip", "second-retention", 0, metadata, 2)
+    assert kv_store.describe("roundtrip")["source_absolute_next_position"] == 9
     # Offset remains owned by the live request after the receipt is delivered.
     controller.runner.requests["target"].num_computed_tokens = 5
     controller.runner.input_batch.num_computed_tokens_cpu = [5]
@@ -1001,3 +1003,121 @@ def test_uninstrumented_fresh_one_token_decode_row_is_zeroed_at_runner_level(fam
     for state in states2:
         assert torch.all(state[2] == -1)
     assert controller2.fresh_decode_rows_zeroed == 0
+
+
+def single_fa_kv_store(controller, metadata):
+    from vllm.v1.worker.compaction_kv import NativeKVSnapshotStore
+
+    kv_store = object.__new__(NativeKVSnapshotStore)
+    kv_store._entries, kv_store._staged = {}, {}
+    cache = torch.arange(8 * 2 * 4 * 6, dtype=torch.float32).reshape(8, 2, 4, 6)
+    kv_store.layers = {
+        "fa": NS(
+            kv_cache=cache,
+            head_size=3,
+            num_kv_heads=2,
+            get_attn_backend=lambda: NS(get_name=lambda: "FLASH_ATTN"),
+        )
+    }
+    controller.kv_store = kv_store
+    metadata["fa"].block_table = torch.tensor([[1, 2]])
+    return kv_store, cache
+
+
+def second_prefill(controller, metadata, request_id):
+    controller.runner.requests[request_id].num_computed_tokens = 2
+    controller.runner.input_batch.num_computed_tokens_cpu = [2]
+    metadata["fa"].seq_lens = torch.tensor([5])
+    metadata["fa"].query_start_loc = torch.tensor([0, 3])
+    return torch.arange(2, 5)
+
+
+@pytest.mark.parametrize("offset", [7, 4])
+def test_chained_import_continues_absolute_positions_from_an_offset_source(offset):
+    """Protocol C: a snapshot captured from an imported-then-continued request
+    (source cursor 5, its new tokens ran at offset 4, absolute next position 9)
+    imports again; the new request's offset must be 9 - retained (= 7)."""
+    descriptor = dict(
+        operation_id="chain",
+        expected_prompt_tokens=5,
+        restore_at=2,
+        kv_restore_name="off",
+        position_offset=offset,
+    )
+    controller, states, metadata, positions, counts = batch_controller(
+        "gdn", [("chain", 0, 2, descriptor, 1)]
+    )
+    kv_store, cache = single_fa_kv_store(controller, metadata)
+    source = kv_store.capture(
+        {"name": "off", "token_indices": [0, 1]},
+        "history",
+        0,
+        metadata,
+        5,
+        source_position_offset=4,
+    )
+    assert source["source_absolute_next_position"] == 9
+    expected_rows = cache[1, :, :2, :].clone()
+    cache.fill_(-9)
+    controller.after_forward(controller.before_forward(metadata, positions, counts))
+    positions = second_prefill(controller, metadata, "chain")
+    if offset != 7:
+        with pytest.raises(
+            CompactionContractError, match="source_absolute_next_position"
+        ):
+            controller.before_forward(metadata, positions, {"chain": 3})
+        assert torch.all(cache == -9) and positions.tolist() == [2, 3, 4]
+        return
+    boundary = controller.before_forward(metadata, positions, {"chain": 3})
+    assert positions.tolist() == [9, 10, 11]
+    assert torch.equal(cache[1, :, :2, :], expected_rows)
+    controller.after_forward(boundary)
+    result = controller.results(["chain"])["chain"]
+    assert result["fa_kv_imported"] and result["kv_restore"]["source_cursor"] == 5
+    assert result["kv_restore"]["query_position_offset"] == 7
+    assert controller._consumed["chain"] == 5
+
+
+@pytest.mark.parametrize("offset", [4, 3])
+def test_synthetic_per_layer_snapshot_imports_through_the_boundary(offset):
+    """A registered (fitted) snapshot with per-layer token indices imports like a
+    capture: rows 0..n-1 at the boundary, new tokens at the source's next
+    position (6 - 2 = 4); any other offset is refused before the write."""
+    descriptor = dict(
+        operation_id="syn",
+        expected_prompt_tokens=5,
+        restore_at=2,
+        kv_restore_name="fit",
+        position_offset=offset,
+    )
+    controller, states, metadata, positions, counts = batch_controller(
+        "gdn", [("syn", 0, 2, descriptor, 1)]
+    )
+    kv_store, cache = single_fa_kv_store(controller, metadata)
+    receipt = kv_store.register(
+        "fit",
+        {"fa": torch.full((2, 2, 6), 3.0)},
+        source_cursor=6,
+        source_position_offset=0,
+        retained_tokens=2,
+        method={"name": "am_test", "params": {}, "inputs": {}},
+        layer_token_indices={"fa": [1, 4]},
+    )
+    assert receipt["synthetic"] and receipt["selection_policy"] == "per_layer"
+    cache.fill_(-9)
+    controller.after_forward(controller.before_forward(metadata, positions, counts))
+    positions = second_prefill(controller, metadata, "syn")
+    if offset != 4:
+        with pytest.raises(
+            CompactionContractError, match="source_absolute_next_position"
+        ):
+            controller.before_forward(metadata, positions, {"syn": 3})
+        assert torch.all(cache == -9)
+        return
+    boundary = controller.before_forward(metadata, positions, {"syn": 3})
+    assert positions.tolist() == [6, 7, 8]
+    assert torch.all(cache[1, :, :2, :] == 3.0) and torch.all(cache[1, :, 2:, :] == -9)
+    controller.after_forward(boundary)
+    result = controller.results(["syn"])["syn"]
+    assert result["kv_restore"]["synthetic"] is True
+    assert result["kv_restore"]["selection_policy"] == "per_layer"

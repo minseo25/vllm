@@ -1318,9 +1318,35 @@ class Worker(WorkerBase):
         """Release a query export unused by active operations."""
         return self._cc_controller().q_drop(name)
 
-    def cc_kv_capture(self, spec: dict, request_id: str) -> dict:
-        """Capture selected KV rows of a resident request outside a forward."""
-        return self._cc_controller().kv_capture(spec, request_id)
+    def cc_kv_capture(
+        self, spec: dict, request_id: str, *, expected_cursor: int
+    ) -> dict:
+        """Capture selected KV rows of a resident request outside a forward.
+
+        ``expected_cursor`` is the request's end cursor known to the caller; it
+        must equal the cursor the controller saw consumed.
+        """
+        return self._cc_controller().kv_capture(
+            spec, request_id, expected_cursor=expected_cursor
+        )
+
+    def cc_kv_subset(
+        self,
+        name_out: str,
+        *,
+        source_snapshot: str,
+        method: dict,
+        token_indices: list[int] | None = None,
+        layer_token_indices: dict[str, list[int]] | None = None,
+    ) -> dict:
+        """Materialise a token selection by slicing an existing KV snapshot."""
+        return self._cc_controller().kv_subset(
+            name_out,
+            source_snapshot=source_snapshot,
+            method=method,
+            token_indices=token_indices,
+            layer_token_indices=layer_token_indices,
+        )
 
     def cc_kv_score(
         self,
@@ -1330,16 +1356,22 @@ class Worker(WorkerBase):
         method: str,
         request_id: str | None = None,
         kv_snapshot: str | None = None,
+        expected_cursor: int | None = None,
         params: dict | None = None,
         key_range: list[int] | None = None,
     ) -> dict:
-        """Score keys per (layer, kv_head, token) with 'h2o' or 'kvzip'."""
+        """Score keys per (layer, kv_head, token) with 'h2o' or 'kvzip'.
+
+        ``expected_cursor`` is required: the request's end cursor for resident
+        sources, the snapshot's ``source_cursor`` for snapshot sources.
+        """
         return self._cc_controller().kv_score(
             name_out,
             q_export=q_export,
             method=method,
             request_id=request_id,
             kv_snapshot=kv_snapshot,
+            expected_cursor=expected_cursor,
             params=params,
             key_range=key_range,
         )
@@ -1350,18 +1382,23 @@ class Worker(WorkerBase):
         *,
         scores: str,
         budget_tokens: int,
+        policy: str,
+        aggregate: str,
         protected: list[int] | None = None,
-        policy: str = "shared",
-        aggregate: str = "max",
     ) -> dict:
-        """Select a uniform token budget per layer from stored scores."""
+        """Select a uniform token budget per layer from stored scores.
+
+        ``policy`` ('shared'|'per_layer') and ``aggregate`` ('max'|'mean') are
+        required; the result carries a ready-made ``method`` record and
+        ``capture_spec``.
+        """
         return self._cc_controller().kv_select(
             name_out,
             scores=scores,
             budget_tokens=budget_tokens,
-            protected=protected,
             policy=policy,
             aggregate=aggregate,
+            protected=protected,
         )
 
     def cc_kv_selections(self) -> dict:
@@ -1376,17 +1413,24 @@ class Worker(WorkerBase):
         budget_tokens: int,
         request_id: str | None = None,
         kv_snapshot: str | None = None,
+        expected_cursor: int | None = None,
         protected: list[int] | None = None,
         params: dict | None = None,
         key_range: list[int] | None = None,
     ) -> dict:
-        """Register an attention-matching synthetic snapshot (keys + fitted values)."""
+        """Register an attention-matching synthetic snapshot (keys + fitted values).
+
+        Resident sources (``request_id``) require ``expected_cursor``;
+        ``protected`` are the frame tokens (frozen K/V unless
+        ``params['refit_protected']``).
+        """
         return self._cc_controller().kv_fit_am(
             name_out,
             q_export=q_export,
             budget_tokens=budget_tokens,
             request_id=request_id,
             kv_snapshot=kv_snapshot,
+            expected_cursor=expected_cursor,
             protected=protected,
             params=params,
             key_range=key_range,

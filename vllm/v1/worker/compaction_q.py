@@ -22,6 +22,20 @@ resolved lazily at call time. Tests inject small fakes with
 :func:`register_methods`. Results are validated for shape, dtype and finiteness
 before they enter :class:`ScoreStore`, :class:`SelectionStore` or a synthetic KV
 snapshot.
+
+Failure semantics
+-----------------
+A hook or contract violation detected *inside* a forward (the hook raising, a
+missing layer at ``after_forward``) propagates out of ``execute_model`` and is
+fatal to the EngineCore: the operation is marked failed, the hook is removed,
+but the engine process does not survive the exception. Pre-forward refusals
+(FULL-graph mode, metadata mismatches) fail the operation before any write.
+Compute ops on a resident request read the paged cache outside a forward; they
+require the request to have run no further step since the cursor the caller
+expects (``expected_cursor``), because the scheduler may reuse pages once the
+request finishes. Residency after ``ingest`` is incidental to the harness's
+resumable sessions, not a property this module can guarantee; prefer
+``kv_snapshot`` sources where the extra host copy is affordable.
 """
 
 from __future__ import annotations
@@ -30,6 +44,9 @@ import copy
 import hashlib
 import importlib
 import json
+import math
+import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -202,18 +219,69 @@ def validate_protected(protected: Any, num_keys: int) -> list[int]:
 class QExportStore:
     """Host copies of post-RoPE queries for flagged prefill rows, per FA layer.
 
-    An entry is opened when the operation is armed (reserving the name), filled
-    chunk by chunk by :class:`QueryExportPlan`, and ``complete`` once every row
-    of ``token_range`` was written for every layer. Buffers are pinned when the
-    source query lives on a CUDA device; ``describe`` records ``pinned``.
+    ``geometry`` fixes every layer's ``(num_heads, num_kv_heads, head_size,
+    dtype, pinned)`` when the store is built, so ``open`` (called when the
+    operation is armed) allocates the full host buffers up front and fails loudly
+    before any forward runs; ``write`` then only checks that the rows match.
+    Buffers are pinned when the model runs on CUDA. Sizes: Qwen3.5-9B has 8 FA
+    layers of 16 x 256 bf16 = 8 KiB per token per layer, 64 KiB per token in
+    total (2 GiB for a 32K export, 8 GiB for 128K); Nemotron-Nano-9B-v2 has 4 FA
+    layers of 40 x 128 bf16 = 40 KiB per token (1.25 GiB at 32K). ``describe``
+    reports ``bytes_per_token``, ``allocation_seconds`` and ``copy_seconds``.
     """
 
-    def __init__(self, layer_names: Any):
+    def __init__(self, layer_names: Any, geometry: dict[str, dict]):
         names = list(layer_names)
         if not names or len(set(names)) != len(names):
             raise CompactionContractError("Query export needs distinct FA layers")
+        if not isinstance(geometry, dict) or set(geometry) != set(names):
+            raise CompactionContractError(
+                "Query export geometry must cover exactly the FA layers"
+            )
         self.layer_names = tuple(names)
+        self.geometry = {
+            name: self._check_geometry(name, geometry[name]) for name in names
+        }
+        if len({(g["dtype"], g["pinned"]) for g in self.geometry.values()}) != 1:
+            raise CompactionContractError(
+                "FA layers must share the query dtype and device for export"
+            )
         self._entries: dict[str, dict] = {}
+
+    @staticmethod
+    def _check_geometry(name: str, spec: Any) -> dict:
+        try:
+            heads, kv_heads = spec["num_heads"], spec["num_kv_heads"]
+            head_size, dtype, pinned = spec["head_size"], spec["dtype"], spec["pinned"]
+        except (KeyError, TypeError) as error:
+            raise CompactionContractError(
+                f"Query export geometry for {name} needs num_heads, num_kv_heads, "
+                "head_size, dtype and pinned"
+            ) from error
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.removeprefix("torch."), None)
+        if (
+            any(type(x) is not int or x < 1 for x in (heads, kv_heads, head_size))
+            or heads % kv_heads
+            or not isinstance(dtype, torch.dtype)
+            or dtype not in EXPORT_DTYPES
+            or not isinstance(pinned, bool)
+        ):
+            raise CompactionContractError(f"Invalid query export geometry: {name}")
+        return {
+            "num_heads": heads,
+            "num_kv_heads": kv_heads,
+            "head_size": head_size,
+            "group_size": heads // kv_heads,
+            "dtype": dtype,
+            "pinned": pinned,
+        }
+
+    def bytes_per_token(self) -> int:
+        return sum(
+            g["num_heads"] * g["head_size"] * torch.finfo(g["dtype"]).bits // 8
+            for g in self.geometry.values()
+        )
 
     def open(
         self,
@@ -223,12 +291,30 @@ class QExportStore:
         request_id: str | None = None,
         operation_id: str | None = None,
     ) -> dict:
+        """Reserve ``name`` and allocate every layer's host buffer for the range."""
         if not isinstance(name, str) or not name:
             raise CompactionContractError("Query export name must be nonempty")
         if name in self._entries:
             raise CompactionContractError("Query export names cannot be reused")
         start, end = _check_token_range(token_range, "export_q token_range")
         rows = end - start
+        started = time.perf_counter()
+        tensors = {}
+        try:
+            for layer, g in self.geometry.items():
+                tensors[layer] = torch.empty(
+                    (rows, g["num_heads"], g["head_size"]),
+                    dtype=g["dtype"],
+                    device="cpu",
+                    pin_memory=g["pinned"],
+                )
+        except Exception as error:
+            raise CompactionContractError(
+                f"Query export buffer allocation failed for {name}: {rows} rows, "
+                f"{rows * self.bytes_per_token()} bytes: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+        first = next(iter(self.geometry.values()))
         self._entries[name] = {
             "name": name,
             "token_range": [start, end],
@@ -236,17 +322,25 @@ class QExportStore:
             "operation_id": operation_id,
             "rows": rows,
             "layer_names": list(self.layer_names),
-            "tensors": {},
-            "shapes": {},
-            "layouts": {},
+            "tensors": tensors,
+            "shapes": {layer: list(t.shape) for layer, t in tensors.items()},
+            "layouts": {
+                layer: {
+                    key: g[key]
+                    for key in ("num_heads", "num_kv_heads", "head_size", "group_size")
+                }
+                for layer, g in self.geometry.items()
+            },
             "query_convention": dict(QUERY_CONVENTION),
-            "dtype": None,
-            "pinned": None,
+            "dtype": str(first["dtype"]),
+            "pinned": first["pinned"],
             "positions": torch.full((rows,), -1, dtype=torch.long),
             "cursors": torch.arange(start, end, dtype=torch.long),
             "filled": torch.zeros(rows, dtype=torch.bool),
             "chunks": [],
-            "bytes": 0,
+            "bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
+            "allocation_seconds": time.perf_counter() - started,
+            "copy_seconds": 0.0,
         }
         return self.describe(name)
 
@@ -271,11 +365,12 @@ class QExportStore:
         *,
         layout: dict | None = None,
     ) -> None:
-        """Copy ``rows`` ([n, Hq, D], device) into host rows starting at cursor.
+        """Copy ``rows`` ([n, Hq, D], device) into the preallocated host buffer.
 
-        ``layout`` records the layer's head geometry (``num_heads``,
-        ``num_kv_heads``, ``head_size``, ``group_size``) in the receipt so the
-        GQA grouping of the exported heads is explicit.
+        The rows must match the layer's geometry (dtype, heads, head size and
+        device class); ``layout`` (the hook's view of the layer: ``num_heads``,
+        ``num_kv_heads``, ``head_size``) must agree with the geometry too, so the
+        GQA grouping recorded in the receipt is the one the rows really have.
         """
         entry = self._entry(name)
         if layer_name not in self.layer_names:
@@ -288,26 +383,29 @@ class QExportStore:
             raise CompactionContractError(
                 f"Unsupported query dtype for export: {rows.dtype}"
             )
-        if layout is not None:
-            heads, kv_heads = layout.get("num_heads"), layout.get("num_kv_heads")
-            if (
-                type(heads) is not int
-                or type(kv_heads) is not int
-                or kv_heads < 1
-                or heads % kv_heads
-                or heads != rows.shape[1]
-                or layout.get("head_size") != rows.shape[2]
-            ):
-                raise CompactionContractError(
-                    f"Query head layout is inconsistent with the rows: {layer_name}"
-                )
-            layout = {**layout, "group_size": heads // kv_heads}
-            previous = entry["layouts"].get(layer_name)
-            if previous is not None and previous != layout:
-                raise CompactionContractError(
-                    f"Query head layout changed between chunks: {layer_name}"
-                )
-            entry["layouts"][layer_name] = layout
+        geometry = self.geometry[layer_name]
+        destination = entry["tensors"][layer_name]
+        if rows.dtype != destination.dtype:
+            raise CompactionContractError(
+                f"Query dtype {rows.dtype} differs from the export geometry "
+                f"{destination.dtype}: {layer_name}"
+            )
+        if tuple(rows.shape[1:]) != tuple(destination.shape[1:]):
+            raise CompactionContractError(
+                f"Query head layout {tuple(rows.shape[1:])} differs from the export "
+                f"geometry {tuple(destination.shape[1:])}: {layer_name}"
+            )
+        if bool(rows.is_cuda) != geometry["pinned"]:
+            raise CompactionContractError(
+                f"Query device differs from the export geometry: {layer_name}"
+            )
+        if layout is not None and any(
+            layout.get(key) != geometry[key]
+            for key in ("num_heads", "num_kv_heads", "head_size")
+        ):
+            raise CompactionContractError(
+                f"Query head layout is inconsistent with the geometry: {layer_name}"
+            )
         start, _ = entry["token_range"]
         first = cursor_start - start
         last = first + rows.shape[0]
@@ -315,32 +413,6 @@ class QExportStore:
             raise CompactionContractError("Exported rows fall outside token_range")
         if bool(entry["filled"][first:last].any()):
             raise CompactionContractError("Query rows were already exported")
-        destination = entry["tensors"].get(layer_name)
-        if destination is None:
-            pinned = bool(rows.is_cuda)
-            destination = torch.empty(
-                (entry["rows"], rows.shape[1], rows.shape[2]),
-                dtype=rows.dtype,
-                device="cpu",
-                pin_memory=pinned,
-            )
-            if entry["dtype"] is None:
-                entry["dtype"] = str(rows.dtype)
-                entry["pinned"] = pinned
-            elif entry["dtype"] != str(rows.dtype) or entry["pinned"] != pinned:
-                raise CompactionContractError(
-                    "FA layers disagree on query dtype or device for export"
-                )
-            entry["tensors"][layer_name] = destination
-            entry["shapes"][layer_name] = list(destination.shape)
-            entry["bytes"] += destination.numel() * destination.element_size()
-        elif (
-            tuple(destination.shape[1:]) != tuple(rows.shape[1:])
-            or destination.dtype != rows.dtype
-        ):
-            raise CompactionContractError(
-                f"Query shape/dtype changed between chunks: {layer_name}"
-            )
         # Synchronous device-to-host copy into owned memory; model tensors untouched.
         destination[first:last].copy_(rows)
 
@@ -366,6 +438,7 @@ class QExportStore:
             raise CompactionContractError("Chunk positions do not match its rows")
         entry["positions"][first:last] = positions.to(torch.long)
         entry["filled"][first:last] = True
+        entry["copy_seconds"] += float(receipt.get("hook_seconds", 0.0))
         entry["chunks"].append(
             {
                 **copy.deepcopy(receipt),
@@ -395,6 +468,9 @@ class QExportStore:
             "dtype": entry["dtype"],
             "pinned": entry["pinned"],
             "bytes": entry["bytes"],
+            "bytes_per_token": self.bytes_per_token(),
+            "allocation_seconds": entry["allocation_seconds"],
+            "copy_seconds": entry["copy_seconds"],
             "first_position": int(entry["positions"][0]) if complete else None,
             "last_position": int(entry["positions"][-1]) if complete else None,
             "chunks": copy.deepcopy(entry["chunks"]),
@@ -571,9 +647,14 @@ class ScoreStore:
         params: dict,
         q_export: str,
         source: dict,
+        variant: str | None = None,
+        library_params: dict | None = None,
+        library_warnings: dict | None = None,
     ) -> dict:
         if not isinstance(name, str) or not name:
             raise CompactionContractError("Score names must be nonempty")
+        if variant is not None and (not isinstance(variant, str) or not variant):
+            raise CompactionContractError("Score variant must be a nonempty string")
         if name in self._entries:
             raise CompactionContractError("Score names cannot be overwritten")
         if not layers or set(layers) != set(key_token_indices):
@@ -595,6 +676,9 @@ class ScoreStore:
         self._entries[name] = {
             "name": name,
             "method": method,
+            "variant": variant,
+            "library_params": copy.deepcopy(library_params),
+            "library_warnings": copy.deepcopy(library_warnings),
             "params": copy.deepcopy(params),
             "q_export": q_export,
             "source": copy.deepcopy(source),
@@ -682,6 +766,121 @@ def _as_long_list(values: Any, label: str) -> list[int]:
     raise CompactionContractError(f"{label} must be a list of ints or an int tensor")
 
 
+DEFAULT_MEMORY_BUDGET_BYTES = 1 << 30  # transient score/fit blocks per library call
+
+
+def memory_budget(device: Any, requested: int | None = None) -> dict:
+    """Transient-block budget handed to the library's ``chunk_for_budget``.
+
+    ``requested`` (``params['memory_budget_bytes']``) wins when given. Otherwise
+    the 1 GiB default is clamped to half of the free device memory
+    (``torch.cuda.mem_get_info``) on CUDA devices and used as is on CPU. The
+    library derives the query chunk from it (``chunk_for_budget``).
+    """
+    if requested is not None:
+        if type(requested) is not int or requested < 1:
+            raise CompactionContractError(
+                "memory_budget_bytes must be a positive integer"
+            )
+        return {"bytes": requested, "policy": "caller", "free_bytes": None}
+    device = torch.device(device)
+    if device.type == "cuda":
+        free, _total = torch.cuda.mem_get_info(device)
+        return {
+            "bytes": max(1, min(DEFAULT_MEMORY_BUDGET_BYTES, int(free) // 2)),
+            "policy": "min(default_1GiB, free_device_memory/2)",
+            "free_bytes": int(free),
+        }
+    return {
+        "bytes": DEFAULT_MEMORY_BUDGET_BYTES,
+        "policy": "default_1GiB",
+        "free_bytes": None,
+    }
+
+
+def _blocking(params: dict, budget: dict | None) -> dict:
+    """Either an explicit ``chunk`` or a ``memory_budget_bytes`` for the library."""
+    chunk = params.get("chunk")
+    if chunk is not None:
+        if type(chunk) is not int or chunk < 1:
+            raise CompactionContractError("chunk must be a positive integer")
+        return {"chunk": chunk}
+    if budget is not None:
+        return {"memory_budget_bytes": int(budget["bytes"])}
+    return {"chunk": DEFAULT_CHUNK}
+
+
+def library_provenance() -> dict:
+    """Package path, git commit and dirtiness of the methods library in use."""
+    info: dict[str, Any] = {
+        "package": METHODS_PACKAGE,
+        "path": None,
+        "commit": None,
+        "dirty": None,
+        "registered_override": sorted(_REGISTRY),
+        "error": None,
+    }
+    try:
+        module = importlib.import_module(METHODS_PACKAGE)
+    except ImportError as error:
+        info["error"] = f"{type(error).__name__}: {error}"
+        return info
+    path = os.path.dirname(os.path.abspath(module.__file__))
+    info["path"] = path
+    try:
+        commit = subprocess.run(
+            ["git", "-C", path, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        status = subprocess.run(
+            ["git", "-C", path, "status", "--porcelain", "--", "."],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        info["error"] = f"{type(error).__name__}: {error}"
+        return info
+    if commit.returncode == 0:
+        info["commit"] = commit.stdout.strip()
+    else:
+        info["error"] = commit.stderr.strip() or "git rev-parse failed"
+    if status.returncode == 0:
+        info["dirty"] = bool(status.stdout.strip())
+    return info
+
+
+def _unwrap_scores(
+    result: Any, method: str
+) -> tuple[torch.Tensor, str | None, dict | None, list | None]:
+    """Accept a ``ScoreResult`` (scores, variant, params, warnings) or a tensor."""
+    if isinstance(result, torch.Tensor):
+        return result, None, None, None
+    scores = getattr(result, "scores", None)
+    variant = getattr(result, "variant", None)
+    if (
+        not isinstance(scores, torch.Tensor)
+        or not isinstance(variant, str)
+        or not variant
+    ):
+        raise CompactionContractError(
+            f"{method}_scores must return a ScoreResult(scores, variant, params) "
+            "or a score tensor"
+        )
+    params = getattr(result, "params", None)
+    warnings = getattr(result, "warnings", None)
+    return (
+        scores,
+        variant,
+        _jsonable(dict(params or {})),
+        _jsonable(list(warnings)) if warnings is not None else None,
+    )
+
+
 def score_layer(
     method: str,
     *,
@@ -692,17 +891,21 @@ def score_layer(
     k_positions: torch.Tensor,
     params: dict,
     k_ref: torch.Tensor | None = None,
-) -> torch.Tensor:
+    budget: dict | None = None,
+) -> dict:
     """Run one scoring method on one layer and validate its ``[Hkv, T]`` output.
 
-    ``h2o``: ``scores.h2o_scores(q, k, scale=, causal=, q_positions=,
-    k_positions=, chunk=)`` with request token indices as positions, so the
-    causal mask (``k_pos <= q_pos``) follows chronological cache order.
-    ``kvzip``: ``scores.kvzip_scores(q_ref, k, scale=, k_ref=, chunk=)`` where
-    ``k_ref`` are the repeat input's own keys (row-aligned with ``q_ref``);
-    ``k_ref=None`` is the library's named "context-only normalisation"
-    deviation and is only allowed with ``params['context_only_normalisation']``.
-    ``scale`` is the model's ``head_size ** -0.5``, passed explicitly.
+    ``h2o``: ``scores.h2o_scores(q, k, scale=, causal=True, q_positions=,
+    k_positions=, chunk= | memory_budget_bytes=)`` with request token indices as
+    positions, so the causal mask (``k_pos <= q_pos``) follows chronological cache
+    order. ``kvzip``: ``scores.kvzip_scores(q_ref, k, scale=, k_ref=,
+    normalisation=, chunk= | memory_budget_bytes=)`` where ``k_ref`` are the repeat
+    input's own keys (row-aligned with ``q_ref``); ``normalisation='paper'`` needs
+    them, ``params['context_only_normalisation']`` selects the library's named
+    ``'context_only'`` deviation. ``scale`` is ``head_size ** -0.5``, passed
+    explicitly. Returns ``{"scores" (float32 CPU), "variant", "library_params",
+    "normalisation", "blocking"}``; ``variant``/``library_params`` are ``None`` when
+    the library returned a bare tensor.
     """
     if method not in SCORE_METHODS:
         raise CompactionContractError(f"Unknown scoring method: {method}")
@@ -710,9 +913,8 @@ def score_layer(
         raise CompactionContractError("q must be [R, Hq, D] and k [T, Hkv, D]")
     if q.shape[1] % k.shape[1] != 0:
         raise CompactionContractError("Query heads must group onto kv heads")
-    chunk = params.get("chunk", DEFAULT_CHUNK)
-    if type(chunk) is not int or chunk < 1:
-        raise CompactionContractError("chunk must be a positive integer")
+    blocking = _blocking(params, budget)
+    normalisation = None
     if method == "h2o":
         result = _call_library(
             "scores",
@@ -720,13 +922,16 @@ def score_layer(
             q,
             k,
             scale=scale,
-            causal=bool(params.get("causal", True)),
+            causal=True,
             q_positions=q_positions.to(k.device),
             k_positions=k_positions.to(k.device),
-            chunk=chunk,
+            **blocking,
         )
     else:
-        if k_ref is None and not params.get("context_only_normalisation"):
+        normalisation = (
+            "context_only" if params.get("context_only_normalisation") else "paper"
+        )
+        if normalisation == "paper" and k_ref is None:
             raise CompactionContractError(
                 "kvzip needs the repeat input's own keys (k_ref); pass "
                 "params={'context_only_normalisation': True} to accept the deviation"
@@ -740,18 +945,32 @@ def score_layer(
                 "k_ref must be [R, Hkv, D] aligned with q_ref"
             )
         result = _call_library(
-            "scores", "kvzip_scores", q, k, scale=scale, k_ref=k_ref, chunk=chunk
+            "scores",
+            "kvzip_scores",
+            q,
+            k,
+            scale=scale,
+            k_ref=k_ref,
+            normalisation=normalisation,
+            **blocking,
         )
+    scores, variant, library_params, warnings = _unwrap_scores(result, method)
     if (
-        not isinstance(result, torch.Tensor)
-        or tuple(result.shape) != (k.shape[1], k.shape[0])
-        or not result.dtype.is_floating_point
-        or not bool(torch.isfinite(result).all())
+        tuple(scores.shape) != (k.shape[1], k.shape[0])
+        or not scores.dtype.is_floating_point
+        or not bool(torch.isfinite(scores).all())
     ):
         raise CompactionContractError(
             f"{method}_scores must return a finite [kv_heads, keys] float tensor"
         )
-    return result.detach().to(device="cpu", dtype=torch.float32)
+    return {
+        "scores": scores.detach().to(device="cpu", dtype=torch.float32),
+        "variant": variant,
+        "library_params": library_params,
+        "library_warnings": warnings,
+        "normalisation": normalisation,
+        "blocking": blocking,
+    }
 
 
 def select_layers(
@@ -765,8 +984,10 @@ def select_layers(
     """Call ``select.uniform_token_budget`` and validate equal-count key lists.
 
     Returns one sorted list of key positions (indices into each layer's scored
-    key axis) per layer, all of length ``min(budget_tokens, keys)`` and all
-    containing ``protected``. ``policy='shared'`` requires identical lists.
+    key axis) per layer, each of length exactly ``budget_tokens`` and containing
+    ``protected``. ``budget_tokens`` above the number of scored keys is refused
+    (the library requires exact counts). ``policy='shared'`` requires identical
+    lists across layers.
     """
     if policy not in SELECT_POLICIES or aggregate not in SELECT_AGGREGATES:
         raise CompactionContractError("Unknown selection policy or aggregate")
@@ -793,7 +1014,6 @@ def select_layers(
         policy=policy,
         aggregate=aggregate,
     )
-    expected = budget_tokens
     if not isinstance(result, (list, tuple)) or len(result) != len(scores):
         raise CompactionContractError(
             "uniform_token_budget must return one list per layer"
@@ -802,7 +1022,7 @@ def select_layers(
     for chosen in result:
         chosen = _as_long_list(chosen, "selection")
         if (
-            len(chosen) != expected
+            len(chosen) != budget_tokens
             or chosen != sorted(set(chosen))
             or any(not 0 <= i < keys for i in chosen)
             or not set(protected) <= set(chosen)
@@ -817,6 +1037,26 @@ def select_layers(
     return selections
 
 
+AM_SUMMARY_KEYS = (
+    "frame_policy",
+    "n_fixed",
+    "n_protected",
+    "solver",
+    "accumulate_dtype",
+    "compute_dtype",
+    "chunk",
+    "memory_budget_bytes",
+    "identity_shortcut",
+    "output_error_before_rel",
+    "output_error_after_rel",
+    "n_dead_columns",
+    "value_norm_ratio",
+    "condition_estimate",
+    "value_guard_rounds",
+    "warnings",
+)
+
+
 def fit_am_layer(
     *,
     q_ref: torch.Tensor,
@@ -824,19 +1064,27 @@ def fit_am_layer(
     v: torch.Tensor,
     budget: int,
     protected: list[int],
+    fixed: list[int],
     scale: float,
     params: dict,
+    budget_bytes: dict | None = None,
 ) -> dict:
     """Call ``am.compact`` (no bias, uniform head budget) for one layer.
 
     Contract (``profiling.compaction_methods.am``): ``compact(q_ref, k, v, budget,
-    bias=False, head_budget='uniform', protected=, scale=, chunk=, ridge=)`` returns
-    an ``AMResult`` whose ``token_indices()`` lists the shared, ascending key
-    positions (``len == budget``, containing ``protected``) and whose
-    ``cache_layout()`` gives ``(k_c, v_c)`` as ``[t, Hkv, D]`` rows aligned with
-    them; ``k_c`` are the original keys (checked exactly here), ``v_c`` the fitted
-    values; ``beta`` must be ``None`` (bias and per-head budgets are M2).
-    Returns ``{"indices", "k_c", "v_c", "variant", "diagnostics"}``.
+    bias=False, head_budget='uniform', protected=, fixed=, scale=, ridge=,
+    chunk= | memory_budget_bytes=)`` returns an ``AMResult``: ``token_indices()``
+    lists the shared ascending key positions (``len == budget``, containing
+    ``protected`` and ``fixed``), ``cache_layout()`` gives ``(k_c, v_c)`` as
+    ``[t, Hkv, D]`` rows aligned with them, ``fixed_mask`` (``bool [Hkv, t]``)
+    marks frozen frame rows. ``fixed`` tokens keep their original K *and* V
+    (frame policy ``fixed``; asserted here row by row); ``protected`` tokens are
+    kept but refit-able (``refit``). ``k_c`` must equal the original keys and
+    ``beta`` must be ``None`` (bias, per-head budgets, ``iters`` and
+    ``mass_weighting`` are M2 and are refused by the caller's param allowlist).
+    ``v_c`` comes back in ``v``'s dtype; pass a float32 ``v`` to obtain
+    pre-cast values. Returns ``{"indices", "k_c", "v_c", "fixed_positions",
+    "variant", "diagnostics", "summary", "blocking"}``.
     """
     if (
         k.ndim != 3
@@ -852,14 +1100,14 @@ def fit_am_layer(
         raise CompactionContractError(
             f"budget ({budget}) exceeds the source keys ({tokens})"
         )
-    if len(protected) > budget:
-        raise CompactionContractError("protected exceeds budget")
-    chunk = params.get("chunk", DEFAULT_CHUNK)
-    if type(chunk) is not int or chunk < 1:
-        raise CompactionContractError("chunk must be a positive integer")
+    if set(protected) & set(fixed):
+        raise CompactionContractError("protected and fixed positions must be disjoint")
+    if len(protected) + len(fixed) > budget:
+        raise CompactionContractError("protected + fixed exceeds budget")
     ridge = params.get("ridge", 0.0)
     if isinstance(ridge, bool) or not isinstance(ridge, (int, float)) or ridge < 0:
         raise CompactionContractError("ridge must be a nonnegative number")
+    blocking = _blocking(params, budget_bytes)
     result = _call_library(
         "am",
         "compact",
@@ -870,9 +1118,10 @@ def fit_am_layer(
         bias=False,
         head_budget="uniform",
         protected=list(protected),
+        fixed=list(fixed),
         scale=scale,
-        chunk=chunk,
         ridge=ridge,
+        **blocking,
     )
     if getattr(result, "beta", None) is not None:
         raise CompactionContractError("AM beta is not importable in M1 (bias=False)")
@@ -889,11 +1138,11 @@ def fit_am_layer(
         len(indices) != budget
         or indices != sorted(set(indices))
         or any(not 0 <= i < tokens for i in indices)
-        or not set(protected) <= set(indices)
+        or not (set(protected) | set(fixed)) <= set(indices)
     ):
         raise CompactionContractError(
             "AM indices must be sorted, unique, inside the key range, keep "
-            "protected keys and match the budget"
+            "protected and fixed keys and match the budget"
         )
     layout = result.cache_layout()
     if not isinstance(layout, tuple) or len(layout) != 2:
@@ -911,10 +1160,106 @@ def fit_am_layer(
     index = torch.tensor(indices, dtype=torch.long, device=k.device)
     if not torch.equal(k_c.to(device=k.device, dtype=k.dtype), k[index]):
         raise CompactionContractError("AM k_c rows differ from the original keys")
+    fixed_mask = getattr(result, "fixed_mask", None)
+    if fixed_mask is None:
+        if fixed:
+            raise CompactionContractError("AM result lacks fixed_mask for fixed rows")
+        fixed_rows = torch.zeros(budget, dtype=torch.bool)
+    else:
+        if (
+            not isinstance(fixed_mask, torch.Tensor)
+            or fixed_mask.dtype != torch.bool
+            or tuple(fixed_mask.shape) != (int(k.shape[1]), budget)
+            or not torch.equal(fixed_mask.all(dim=0), fixed_mask.any(dim=0))
+        ):
+            raise CompactionContractError("AM fixed_mask must be bool [Hkv, t], shared")
+        fixed_rows = fixed_mask[0].cpu()
+    flagged = {indices[i] for i in range(budget) if bool(fixed_rows[i])}
+    if flagged != set(fixed):
+        raise CompactionContractError(
+            f"AM fixed_mask marks {sorted(flagged)} but fixed = {sorted(fixed)}"
+        )
+    if flagged:
+        rows = fixed_rows.to(k.device)
+        original = v[index][rows].to(device=v_c.device, dtype=v_c.dtype)
+        if not torch.equal(v_c.to(v_c.device)[rows.to(v_c.device)], original):
+            raise CompactionContractError(
+                "AM v_c differs from the original values on fixed rows"
+            )
+    diagnostics = _jsonable(getattr(result, "diagnostics", {}))
     return {
         "indices": indices,
         "k_c": k_c.detach(),
         "v_c": v_c.detach(),
+        "fixed_positions": sorted(flagged),
         "variant": str(getattr(result, "variant", "unknown")),
-        "diagnostics": _jsonable(getattr(result, "diagnostics", {})),
+        "warnings": _jsonable(list(getattr(result, "warnings", None) or [])),
+        "diagnostics": diagnostics,
+        "summary": {
+            key: diagnostics.get(key) if isinstance(diagnostics, dict) else None
+            for key in AM_SUMMARY_KEYS
+        },
+        "blocking": blocking,
     }
+
+
+def cast_error(reference: torch.Tensor, cast: torch.Tensor) -> dict:
+    """Value-space error introduced by casting fitted values to the cache dtype."""
+    reference = reference.detach().float()
+    difference = cast.detach().float() - reference
+    norm = float(reference.norm())
+    return {
+        "max_abs": float(difference.abs().max()) if difference.numel() else 0.0,
+        "rel_fro": float(difference.norm()) / norm if norm > 0 else 0.0,
+    }
+
+
+def attention_output_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_c: torch.Tensor,
+    v_c: torch.Tensor,
+    *,
+    scale: float,
+    rows_per_block: int = DEFAULT_CHUNK,
+) -> dict:
+    """Output error of the *stored* compacted rows against the full cache.
+
+    Per kv head ``h`` (query heads ``h*G .. (h+1)*G-1``, contiguous GQA blocks) in
+    float32: ``Y_ref = softmax(scale q K_h^T) V_h`` over all ``T`` keys and
+    ``Y_c = softmax(scale q K_c^T) V_c`` over the retained rows exactly as they
+    will sit in the cache (after any dtype cast, no bias). Returns per-head
+    absolute and relative (``/ ||Y_ref||_F``) Frobenius errors and ``max_rel``.
+    Queries are processed in blocks of ``rows_per_block`` grouped rows.
+    """
+    if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape or k_c.shape != v_c.shape:
+        raise CompactionContractError("output error needs q [R,Hq,D], k/v and k_c/v_c")
+    heads, kv_heads = int(q.shape[1]), int(k.shape[1])
+    if heads % kv_heads or k_c.shape[1] != kv_heads or k_c.shape[2] != k.shape[2]:
+        raise CompactionContractError("output error: head layout mismatch")
+    if type(rows_per_block) is not int or rows_per_block < 1:
+        raise CompactionContractError("rows_per_block must be a positive integer")
+    group = heads // kv_heads
+    q32, k32, v32 = q.detach().float(), k.detach().float(), v.detach().float()
+    kc32, vc32 = (
+        k_c.detach().float().to(k32.device),
+        v_c.detach().float().to(k32.device),
+    )
+    absolute, relative = [], []
+    for h in range(kv_heads):
+        rows = q32[:, h * group : (h + 1) * group, :].reshape(-1, q32.shape[2])
+        keys_h, values_h = k32[:, h, :], v32[:, h, :]
+        keys_c, values_c = kc32[:, h, :], vc32[:, h, :]
+        numerator = denominator = 0.0
+        for start in range(0, rows.shape[0], rows_per_block):
+            block = rows[start : start + rows_per_block]
+            y_ref = torch.softmax(block @ keys_h.T * scale, dim=-1) @ values_h
+            y_c = torch.softmax(block @ keys_c.T * scale, dim=-1) @ values_c
+            numerator += float(((y_ref - y_c) ** 2).sum())
+            denominator += float((y_ref**2).sum())
+        absolute.append(math.sqrt(numerator))
+        relative.append(
+            math.sqrt(numerator) / math.sqrt(denominator) if denominator > 0 else 0.0
+        )
+    return {"abs": absolute, "rel": relative, "max_rel": max(relative)}

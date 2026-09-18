@@ -63,6 +63,23 @@ def split_kv(rows: torch.Tensor, head_size: int) -> tuple[torch.Tensor, torch.Te
     return rows[..., :head_size], rows[..., head_size:]
 
 
+def validate_method(method: Any) -> dict:
+    """A self-describing method record: ``name``, ``params``, ``inputs``; JSON-safe."""
+    if (
+        not isinstance(method, dict)
+        or not isinstance(method.get("name"), str)
+        or not method["name"]
+        or not isinstance(method.get("params"), dict)
+        or not isinstance(method.get("inputs"), dict)
+    ):
+        raise ValueError("method must carry name, params and inputs")
+    try:
+        json.dumps(method)
+    except (TypeError, ValueError) as error:
+        raise ValueError("method must be JSON-serializable") from error
+    return copy.deepcopy(method)
+
+
 class NativeKVSnapshotStore:
     """Immutable CPU snapshots, with optional reusable GPU staging copies."""
 
@@ -83,12 +100,18 @@ class NativeKVSnapshotStore:
     def _layer_indices(
         self, spec: dict, computed_tokens: int
     ) -> tuple[str, dict[str, list[int]]]:
-        """Resolve a capture spec into per-layer index lists and its policy."""
+        """Resolve a capture spec into per-layer index lists and its policy.
+
+        ``spec`` may also carry an optional ``method`` record (validated like
+        ``register``'s) describing how the selection was produced.
+        """
         if not isinstance(spec, dict) or "name" not in spec:
             raise ValueError("KV capture requires name and token_indices")
         if not isinstance(spec["name"], str) or not spec["name"]:
             raise ValueError("KV snapshot name must be nonempty")
-        keys = set(spec)
+        if "method" in spec:
+            validate_method(spec["method"])
+        keys = set(spec) - {"method"}
         if keys == {"name", "token_indices"}:
             indices = _validate_index_list(spec["token_indices"], computed_tokens)
             return "shared", {name: list(indices) for name in self.layers}
@@ -227,7 +250,7 @@ class NativeKVSnapshotStore:
             "layer_token_indices": {name: list(v) for name, v in per_layer.items()},
             "retained_tokens": len(first),
             "synthetic": False,
-            "method": None,
+            "method": (validate_method(spec["method"]) if "method" in spec else None),
             "bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
             "digest": _digest(tensors),
             "digest_verified_at": "capture",
@@ -279,18 +302,7 @@ class NativeKVSnapshotStore:
             raise ValueError("KV register requires FA layers")
         if not isinstance(tensors, dict) or set(tensors) != set(self.layers):
             raise ValueError("Synthetic KV must provide exactly the FA layers")
-        if (
-            not isinstance(method, dict)
-            or not isinstance(method.get("name"), str)
-            or not method["name"]
-            or not isinstance(method.get("params"), dict)
-            or not isinstance(method.get("inputs"), dict)
-        ):
-            raise ValueError("method must carry name, params and inputs")
-        try:
-            json.dumps(method)
-        except (TypeError, ValueError) as error:
-            raise ValueError("method must be JSON-serializable") from error
+        method = validate_method(method)
         if layer_token_indices is not None and token_indices is not None:
             raise ValueError("Give layer_token_indices or token_indices, not both")
         policy = None
@@ -391,6 +403,84 @@ class NativeKVSnapshotStore:
         self.describe(name)
         return dict(self._entries[name]["tensors"])
 
+    # ---------------------------------------------------------------- subset
+    def subset(
+        self,
+        name: str,
+        source: str,
+        *,
+        method: dict,
+        token_indices: list[int] | None = None,
+        layer_token_indices: dict[str, list[int]] | None = None,
+    ) -> dict:
+        """Materialise a selection by slicing an existing snapshot on the CPU.
+
+        The requested tokens (one shared list or one list per FA layer, equal
+        counts) must be a subset of the source snapshot's recorded token indices
+        for each layer; rows are gathered from the source's immutable CPU tensors,
+        so no cache pass is needed. ``source_cursor``, ``source_position_offset``
+        and ``request_id`` are inherited, ``derived_from`` names the source and
+        its digest, and ``method`` records how the selection was produced.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("KV snapshot name must be nonempty")
+        if name in self._entries:
+            raise ValueError("KV snapshot names cannot be overwritten")
+        origin = self._entries.get(source)
+        if origin is None:
+            raise ValueError(f"Unknown KV snapshot: {source}")
+        if origin["layer_token_indices"] is None:
+            raise ValueError("Source snapshot records no token indices to subset")
+        method = validate_method(method)
+        if (token_indices is None) == (layer_token_indices is None):
+            raise ValueError("Give token_indices or layer_token_indices, not both")
+        spec = {"name": name}
+        if token_indices is not None:
+            spec["token_indices"] = token_indices
+        else:
+            spec["layer_token_indices"] = layer_token_indices
+        policy, per_layer = self._layer_indices(spec, origin["source_cursor"])
+        tensors = {}
+        for layer_name, requested in per_layer.items():
+            available = origin["layer_token_indices"][layer_name]
+            position_of = {token: row for row, token in enumerate(available)}
+            missing = [t for t in requested if t not in position_of]
+            if missing:
+                raise ValueError(
+                    f"Subset tokens are not in the source snapshot ({layer_name}): "
+                    f"{missing[:8]}"
+                )
+            rows = torch.tensor([position_of[t] for t in requested], dtype=torch.long)
+            tensors[layer_name] = (
+                origin["tensors"][layer_name][rows].contiguous().clone()
+            )
+        first = next(iter(per_layer.values()))
+        self._entries[name] = {
+            "name": name,
+            "request_id": origin["request_id"],
+            "source_cursor": origin["source_cursor"],
+            "source_position_offset": origin["source_position_offset"],
+            "source_absolute_next_position": origin["source_absolute_next_position"],
+            "selection_policy": policy,
+            "token_indices": list(first) if policy == "shared" else None,
+            "layer_token_indices": {k: list(v) for k, v in per_layer.items()},
+            "retained_tokens": len(first),
+            "synthetic": origin["synthetic"],
+            "method": method,
+            "derived_from": {
+                "name": source,
+                "digest": origin["digest"],
+                "retained_tokens": origin["retained_tokens"],
+                "selection_policy": origin["selection_policy"],
+                "synthetic": origin["synthetic"],
+            },
+            "bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
+            "digest": _digest(tensors),
+            "digest_verified_at": "subset",
+            "tensors": tensors,
+        }
+        return self.describe(name)
+
     # ------------------------------------------------------------- metadata
     def describe(self, name: str) -> dict:
         if name not in self._entries:
@@ -460,11 +550,9 @@ class NativeKVSnapshotStore:
         computed_tokens: int,
     ) -> None:
         entry = self.describe(name)
-        if entry["source_position_offset"]:
-            raise ValueError(
-                "Repeated selected-KV import from an offset source is unsupported; "
-                "this snapshot is available for audit only"
-            )
+        # Offset sources (captured from an imported-then-continued request) are
+        # importable: their rows keep original RoPE positions and the controller
+        # requires position_offset == source_absolute_next_position - computed.
         if computed_tokens != entry["retained_tokens"]:
             raise ValueError(
                 "KV import must follow exactly the retained scratch prefix"

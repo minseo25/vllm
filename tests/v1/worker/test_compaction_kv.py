@@ -122,8 +122,11 @@ def test_retain_all_roundtrip_is_identity():
     )
 
 
-def test_offset_source_is_auditable_but_cannot_be_silently_rebased_on_import():
+def test_offset_source_imports_and_records_its_absolute_next_position():
+    """Chained imports: rows keep their RoPE positions; the controller checks
+    position_offset == source_absolute_next_position - computed at import."""
     store, layers, metadata = fixture_store()
+    source = layers["a"].kv_cache.clone()
     entry = store.capture(
         {"name": "offset", "token_indices": [0, 1]},
         "s",
@@ -134,10 +137,46 @@ def test_offset_source_is_auditable_but_cannot_be_silently_rebased_on_import():
     )
     assert entry["source_absolute_next_position"] == 104
     store.audit("offset")
-    before = layers["a"].kv_cache.clone()
-    with pytest.raises(ValueError, match="offset source"):
-        store.restore("offset", "d", 1, metadata, 2)
-    assert torch.equal(layers["a"].kv_cache, before)
+    receipt = store.restore("offset", "d", 1, metadata, 2)
+    assert receipt["source_cursor"] == 4
+    expected = source[torch.tensor([2, 2]), :, torch.tensor([0, 1]), :]
+    assert torch.equal(layers["a"].kv_cache[5, :, :2, :].transpose(0, 1), expected)
+
+
+def test_capture_spec_may_carry_a_self_describing_method_record():
+    store, _, metadata = fixture_store()
+    method = {
+        "name": "streamingllm",
+        "params": {"recent": 1},
+        "inputs": {"scores": None},
+    }
+    receipt = store.capture(
+        {"name": "ev", "token_indices": [0, 3], "method": method}, "s", 0, metadata, 4
+    )
+    assert receipt["method"] == method and receipt["synthetic"] is False
+    method["params"]["recent"] = 99  # the entry holds its own copy
+    assert store.describe("ev")["method"]["params"]["recent"] == 1
+    with pytest.raises(ValueError, match="method must carry"):
+        store.capture(
+            {"name": "bad", "token_indices": [0], "method": {"name": "x"}},
+            "s",
+            0,
+            metadata,
+            4,
+        )
+    with pytest.raises(ValueError, match="JSON"):
+        store.capture(
+            {
+                "name": "bad",
+                "token_indices": [0],
+                "method": {"name": "x", "params": {"t": object()}, "inputs": {}},
+            },
+            "s",
+            0,
+            metadata,
+            4,
+        )
+    assert set(store.list()["snapshots"]) == {"ev"}
 
 
 # ---------------------------------------------------------------- per-layer

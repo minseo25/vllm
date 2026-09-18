@@ -4,10 +4,13 @@
 
 The attention custom op is modelled by calling each FA layer's
 ``compaction_q_export`` hook exactly as ``unified_attention_with_output`` does.
-Methods-library calls go to small fakes injected through the registry; the
-tests check the fork's routing, validation and bookkeeping, not the math.
+Methods-library calls go to small fakes injected through the registry (they
+mirror the committed ``profiling.compaction_methods`` result types); one test
+resolves the real package from the repository root so contract drift fails.
 """
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -31,6 +34,9 @@ from vllm.v1.worker.compaction_q import (
 
 FA = ("fa0", "fa1")
 HEAD, KV_HEADS, Q_HEADS, BLOCK = 3, 2, 4, 4
+CTX = 6  # consumed cursor of the resident request in compute-op tests
+LAGGING = 3  # the worker's num_computed_tokens copy after the last chunk
+REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
 @pytest.fixture(autouse=True)
@@ -39,19 +45,33 @@ def _clear_methods():
     compaction_q.clear_methods()
 
 
-def fa_layer(index, name):
+def geometry(dtype=torch.float32, heads=Q_HEADS, kv_heads=KV_HEADS, layers=FA):
+    return {
+        name: {
+            "num_heads": heads,
+            "num_kv_heads": kv_heads,
+            "head_size": HEAD,
+            "dtype": dtype,
+            "pinned": False,
+        }
+        for name in layers
+    }
+
+
+def fa_layer(index, name, dtype=torch.float32):
     cache = (
         torch.arange(8 * KV_HEADS * BLOCK * 2 * HEAD, dtype=torch.float32).reshape(
             8, KV_HEADS, BLOCK, 2 * HEAD
         )
         + 1000.0 * index
-    )
+    ).to(dtype)
     return NS(
         layer_name=name,
         kv_cache=cache,
         head_size=HEAD,
         num_kv_heads=KV_HEADS,
         num_heads=Q_HEADS,
+        dtype=dtype,
         impl=NS(scale=HEAD**-0.5),
         get_attn_backend=lambda: NS(get_name=lambda: "FLASH_ATTN"),
         compaction_q_export=None,
@@ -77,8 +97,12 @@ def gdn_metadata(requests, num_decodes=0):
     )
 
 
-def make_controller(requests):
-    """Requests: (id, cursor, query_count, descriptor|None, state_index)."""
+def make_controller(requests, *, consumed=None, dtype=torch.float32):
+    """Requests: (id, cursor, query_count, descriptor|None, state_index).
+
+    ``consumed`` seeds the controller's tracked cursors (what it saw consumed);
+    the batch copies hold the request cursors given in ``requests``.
+    """
     controller = object.__new__(NativeCompactionController)
     controller.store = SnapshotStore()
     controller.operation = None
@@ -93,15 +117,17 @@ def make_controller(requests):
     controller.metadata_types = {"gdn": NS}
     controller.fa_layers = set(FA)
     controller.fa_layer_groups = {name: 0 for name in FA}
-    layers = {name: fa_layer(i, name) for i, name in enumerate(FA)}
+    layers = {name: fa_layer(i, name, dtype) for i, name in enumerate(FA)}
     kv_store = object.__new__(NativeKVSnapshotStore)
     kv_store._entries, kv_store._staged = {}, {}
     kv_store.layers = layers
     controller.kv_store = kv_store
-    controller.q_store = QExportStore(FA)
+    controller.q_store = QExportStore(FA, controller._export_geometry())
     controller.score_store = ScoreStore()
     controller.selection_store = SelectionStore()
     controller._export_plan = None
+    controller._consumed = dict(consumed or {})
+    controller._pending_consumed = None
     table = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
     controller.runner = NS(
         execute_model_state=None,
@@ -157,9 +183,11 @@ def forward_inputs(requests, controller, num_decodes=0):
     return metadata, positions, {r[0]: r[2] for r in requests}
 
 
-def query_batch(total):
-    return torch.arange(total * Q_HEADS * HEAD, dtype=torch.float32).reshape(
-        total, Q_HEADS, HEAD
+def query_batch(total, dtype=torch.float32):
+    return (
+        torch.arange(total * Q_HEADS * HEAD, dtype=torch.float32)
+        .reshape(total, Q_HEADS, HEAD)
+        .to(dtype)
     )
 
 
@@ -242,10 +270,17 @@ def test_mixed_batch_exports_only_the_flagged_requests_rows_for_every_layer():
     assert hooks_installed(layers) == list(FA)
     opened = controller.q_exports()["exports"]["Q"]
     assert opened["complete"] is False and opened["request_id"] == "flag"
+    # Buffers exist before the forward: geometry-derived size, allocation timed.
+    assert opened["bytes"] == 2 * opened["bytes_per_token"]
+    assert opened["bytes_per_token"] == len(FA) * Q_HEADS * HEAD * 4
+    assert opened["allocation_seconds"] >= 0.0 and opened["copy_seconds"] == 0.0
     query = query_batch(5)
     run_attention(layers, query, metadata)
     controller.after_forward(boundary)
     assert hooks_installed(layers) == [] and controller._export_plan is None
+    # Consumed cursors are tracked although the worker copies still lag.
+    assert controller._consumed == {"other": 2, "flag": 3}
+    assert controller.runner.input_batch.num_computed_tokens_cpu == [0, 0]
     export = controller.q_store.describe("Q")
     assert export["complete"] and export["rows"] == export["rows_exported"] == 2
     assert export["dtype"] == "torch.float32" and export["pinned"] is False
@@ -264,7 +299,7 @@ def test_mixed_batch_exports_only_the_flagged_requests_rows_for_every_layer():
     chunk = export["chunks"][0]
     assert (chunk["batch_row"], chunk["graph_mode"]) == (1, "PIECEWISE")
     assert (chunk["cursor_start"], chunk["cursor_end"], chunk["rows"]) == (1, 3, 2)
-    assert chunk["hook_seconds"] >= 0.0
+    assert chunk["hook_seconds"] >= 0.0 and export["copy_seconds"] >= 0.0
     tensors = controller.q_store.tensors("Q")
     for name in FA:
         # "flag" occupies batch rows 2..4; its cursors 1..2 are rows 3 and 4.
@@ -277,6 +312,23 @@ def test_mixed_batch_exports_only_the_flagged_requests_rows_for_every_layer():
     assert receipt["export_q"] == {"name": "Q", "token_range": [1, 3]}
     assert receipt["q_export_chunks"][0]["rows"] == 2
     assert receipt["query_export"] and "kv_score" in receipt["compute_ops"]
+
+
+def test_padded_hook_call_exports_only_the_real_rows():
+    desc = dict(
+        operation_id="p",
+        expected_prompt_tokens=3,
+        export_q={"name": "Q", "token_range": [0, 3]},
+    )
+    requests = [("r", 0, 3, desc, 2)]
+    controller, layers, _ = make_controller(requests)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    boundary = controller.before_forward(metadata, positions, counts)
+    padded = torch.cat([query_batch(3), torch.full((5, Q_HEADS, HEAD), 7.0)])
+    run_attention(layers, padded, metadata)
+    controller.after_forward(boundary)
+    for name in FA:
+        assert torch.equal(controller.q_store.tensors("Q")[name], query_batch(3))
 
 
 def test_multi_chunk_prefill_fills_the_range_across_forwards_then_decode_is_silent():
@@ -312,6 +364,7 @@ def test_multi_chunk_prefill_fills_the_range_across_forwards_then_decode_is_sile
     for name in FA:
         assert torch.equal(tensors[name][0], first[1])
         assert torch.equal(tensors[name][1:], second[0:2])
+    assert controller._consumed["r"] == 5
     # A FULL-graph decode step after the prompt installs nothing and is allowed.
     requests = [("r", 5, 1, desc, 2)]
     advance(controller, requests)
@@ -321,27 +374,50 @@ def test_multi_chunk_prefill_fills_the_range_across_forwards_then_decode_is_sile
     assert controller._export_plan is None
     run_attention(layers, query_batch(1), metadata)
     controller.after_forward(boundary)
+    assert controller._consumed["r"] == 6
     result = controller.results(["m"])["m"]
     assert len(result["q_export_chunks"]) == 2 and result["q_export"]["complete"]
     assert result["forward_calls"] == 3
+    controller.finish_requests({"r"})
+    assert "r" not in controller._consumed
 
 
-def test_full_graph_forward_with_export_rows_is_refused_before_any_write():
-    desc = dict(
+def test_full_graph_refusal_precedes_co_scheduled_restores_and_state_writes():
+    carry = dict(
+        operation_id="c", expected_prompt_tokens=3, restore_name="H", restore_at=0
+    )
+    flagged = dict(
         operation_id="g",
         expected_prompt_tokens=3,
         export_q={"name": "Q", "token_range": [0, 3]},
     )
-    requests = [("r", 0, 3, desc, 2)]
-    controller, layers, _ = make_controller(requests)
+    requests = [("carry", 0, 3, carry, 2), ("flag", 0, 3, flagged, 3)]
+    controller, layers, states = make_controller(requests)
+    donor = torch.full((3, 2, 3), 7.0), torch.full((3, 2, 4, 4), 7.0)
+    from vllm.v1.worker.compaction import resolve_slot
+
+    slot_md = NS(
+        num_prefills=1,
+        num_decodes=0,
+        num_spec_decodes=0,
+        prefill_state_indices=torch.tensor([1]),
+        non_spec_state_indices_tensor=torch.tensor([1]),
+        has_initial_state=torch.tensor([False]),
+        prefill_has_initial_state=torch.tensor([False]),
+    )
+    controller.store.capture("H", [resolve_slot("layer0", "gdn", donor, slot_md)], {})
     metadata, positions, counts = forward_inputs(requests, controller)
     with pytest.raises(CompactionContractError, match="FULL"):
-        controller.before_forward(metadata, positions, counts, "FULL", 1)
+        controller.before_forward(metadata, positions, counts, "FULL", 2)
+    # Refused before the co-scheduled state restore: nothing staged or written.
+    assert torch.all(states[1] == -1) and torch.all(states[0] == -1)
+    assert not metadata["layer0"].has_initial_state.any()
+    assert controller.store._staged == {}
     assert hooks_installed(layers) == [] and controller._export_plan is None
     assert "FULL" in controller.operations["g"].failed
+    assert "FULL" in controller.operations["c"].failed
     assert controller.q_store.describe("Q")["rows_exported"] == 0
-    with pytest.raises(CompactionContractError, match="FULL"):
-        controller.results(["g"])
+    assert controller._pending_consumed is None and controller._consumed == {}
 
 
 def test_export_requires_query_start_loc_to_match_the_batch_token_start():
@@ -365,6 +441,7 @@ def test_after_forward_fails_closed_when_a_layer_skipped_the_hook():
         operation_id="m",
         expected_prompt_tokens=3,
         export_q={"name": "Q", "token_range": [0, 3]},
+        capture_kv={"name": "K", "token_indices": [0]},
     )
     requests = [("r", 0, 3, desc, 2)]
     controller, layers, _ = make_controller(requests)
@@ -377,8 +454,13 @@ def test_after_forward_fails_closed_when_a_layer_skipped_the_hook():
     assert hooks_installed(layers) == [] and controller._export_plan is None
     assert "did not run" in controller.operations["m"].failed
     assert controller.q_store.describe("Q")["rows_exported"] == 0
+    # The forward itself ran: the consumed cursor was still committed.
+    assert controller._consumed == {"r": 3}
     with pytest.raises(CompactionContractError, match="did not run"):
         controller.results(["m"])
+    # A failed operation must be closable: its export buffers can be dropped.
+    assert controller.q_drop("Q")["exports"] == {}
+    assert controller.kv_store.list()["snapshots"] == {}
 
 
 @pytest.mark.parametrize("fault", ["twice", "foreign", "short", "actual", "heads"])
@@ -458,35 +540,64 @@ def test_failed_model_forward_uninstalls_the_hook_and_keeps_rows_uncommitted():
     metadata, positions, counts = forward_inputs(requests, controller)
     controller.before_forward(metadata, positions, counts)
     assert hooks_installed(layers) == list(FA)
+    assert controller._pending_consumed == {"r": 3}
     controller.fail_forward(RuntimeError("kernel failed"))
     assert hooks_installed(layers) == [] and controller._export_plan is None
     assert controller.q_store.describe("Q")["rows_exported"] == 0
+    assert controller._pending_consumed is None and controller._consumed == {}
+
+
+def test_consumed_cursor_tracking_covers_uninstrumented_rows_and_clears_on_finish():
+    requests = [("plain", 4, 2, None, 2)]
+    controller, _, _ = make_controller(requests)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    assert controller.before_forward(metadata, positions, counts) is None
+    assert controller._pending_consumed == {"plain": 6}
+    controller.after_forward(None)
+    assert controller._consumed == {"plain": 6}
+    controller.finish_requests({"plain"})
+    assert controller._consumed == {}
 
 
 # ------------------------------------------------------------ store units
 
 
-def test_export_store_validates_ranges_dtypes_and_double_writes():
-    store = QExportStore(FA)
+def test_export_store_allocates_from_geometry_and_validates_writes():
+    with pytest.raises(CompactionContractError, match="cover exactly"):
+        QExportStore(FA, {"fa0": geometry()["fa0"]})
+    with pytest.raises(CompactionContractError, match="Invalid query export geometry"):
+        QExportStore(FA, {n: {**geometry()[n], "num_heads": 3} for n in FA})
+    with pytest.raises(CompactionContractError, match="needs num_heads"):
+        QExportStore(FA, {n: {"num_heads": 2} for n in FA})
+    store = QExportStore(FA, geometry(heads=2, kv_heads=1))
+    assert store.bytes_per_token() == 2 * 2 * 3 * 4
     with pytest.raises(CompactionContractError, match="start < end"):
         store.open("bad", token_range=[3, 3])
-    store.open("Q", token_range=[2, 4])
+    opened = store.open("Q", token_range=[2, 4])
+    assert opened["bytes"] == 2 * store.bytes_per_token()
+    assert opened["shapes"] == {n: [2, 2, 3] for n in FA}
+    assert opened["layouts"]["fa0"]["group_size"] == 2
+    assert opened["allocation_seconds"] >= 0.0
     with pytest.raises(CompactionContractError, match="reused"):
         store.open("Q", token_range=[0, 1])
     with pytest.raises(CompactionContractError, match="Unsupported query dtype"):
         store.write("Q", "fa0", torch.zeros(1, 2, 3, dtype=torch.float8_e4m3fn), 2)
-    with pytest.raises(CompactionContractError, match="outside token_range"):
-        store.write("Q", "fa0", torch.zeros(3, 2, 3), 2)
-    with pytest.raises(CompactionContractError, match="Unexpected query export layer"):
-        store.write("Q", "zz", torch.zeros(1, 2, 3), 2)
-    with pytest.raises(CompactionContractError, match="head layout is inconsistent"):
+    with pytest.raises(CompactionContractError, match="dtype .* differs"):
+        store.write("Q", "fa0", torch.zeros(1, 2, 3, dtype=torch.float16), 2)
+    with pytest.raises(CompactionContractError, match="head layout .* differs"):
+        store.write("Q", "fa0", torch.zeros(1, 2, 4), 2)
+    with pytest.raises(CompactionContractError, match="inconsistent with the geometry"):
         store.write(
             "Q",
             "fa0",
             torch.ones(2, 2, 3),
             2,
-            layout={"num_heads": 3, "num_kv_heads": 2, "head_size": 3},
+            layout={"num_heads": 2, "num_kv_heads": 2, "head_size": 3},
         )
+    with pytest.raises(CompactionContractError, match="outside token_range"):
+        store.write("Q", "fa0", torch.zeros(3, 2, 3), 2)
+    with pytest.raises(CompactionContractError, match="Unexpected query export layer"):
+        store.write("Q", "zz", torch.zeros(1, 2, 3), 2)
     store.write(
         "Q",
         "fa0",
@@ -494,11 +605,6 @@ def test_export_store_validates_ranges_dtypes_and_double_writes():
         2,
         layout={"num_heads": 2, "num_kv_heads": 1, "head_size": 3},
     )
-    assert store.describe("Q")["layouts"] == {
-        "fa0": {"num_heads": 2, "num_kv_heads": 1, "head_size": 3, "group_size": 2}
-    }
-    with pytest.raises(CompactionContractError, match="shape/dtype changed"):
-        store.write("Q", "fa0", torch.ones(1, 2, 4), 2)
     with pytest.raises(CompactionContractError, match="missed FA layers"):
         store.commit(
             "Q",
@@ -515,18 +621,53 @@ def test_export_store_validates_ranges_dtypes_and_double_writes():
         cursor_end=4,
         positions=torch.tensor([7, 8]),
         layers_written=set(FA),
-        receipt={},
+        receipt={"hook_seconds": 0.25},
     )
     with pytest.raises(CompactionContractError, match="already exported"):
         store.write("Q", "fa0", torch.ones(1, 2, 3), 3)
+    described = store.describe("Q")
+    assert described["copy_seconds"] == 0.25 and described["complete"]
     assert store.positions("Q").tolist() == [7, 8]
     assert store.list()["total_host_bytes"] == 2 * 2 * 2 * 3 * 4
     with pytest.raises(CompactionContractError, match="Unknown query export"):
         store.describe("nope")
 
 
+def test_bf16_export_path_writes_into_preallocated_bf16_buffers():
+    desc = dict(
+        operation_id="b",
+        expected_prompt_tokens=2,
+        export_q={"name": "Q", "token_range": [0, 2]},
+    )
+    requests = [("r", 0, 2, desc, 2)]
+    controller, layers, _ = make_controller(requests, dtype=torch.bfloat16)
+    assert controller.q_store.geometry["fa0"]["dtype"] == torch.bfloat16
+    metadata, positions, counts = forward_inputs(requests, controller)
+    boundary = controller.before_forward(metadata, positions, counts)
+    opened = controller.q_store.describe("Q")
+    assert opened["dtype"] == "torch.bfloat16" and opened["pinned"] is False
+    assert opened["bytes"] == 2 * len(FA) * Q_HEADS * HEAD * 2
+    with pytest.raises(CompactionContractError, match="dtype .* differs"):
+        layers["fa0"].compaction_q_export(
+            layers["fa0"], query_batch(2), metadata["fa0"]
+        )
+    controller.fail_forward(RuntimeError("stop"))
+    assert controller.q_drop("Q")["exports"] == {}
+    # A matching bf16 query lands in the preallocated bf16 buffers.
+    controller, layers, _ = make_controller(requests, dtype=torch.bfloat16)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    boundary = controller.before_forward(metadata, positions, counts)
+    query = query_batch(2, torch.bfloat16)
+    run_attention(layers, query, metadata)
+    controller.after_forward(boundary)
+    tensors = controller.q_store.tensors("Q")
+    for name in FA:
+        assert tensors[name].dtype == torch.bfloat16
+        assert torch.equal(tensors[name], query)
+
+
 def test_export_plan_rejects_rows_outside_the_token_batch():
-    store = QExportStore(FA)
+    store = QExportStore(FA, geometry())
     store.open("Q", token_range=[0, 4])
     item = compaction_q.ExportItem(
         name="Q",
@@ -546,11 +687,31 @@ def test_export_plan_rejects_rows_outside_the_token_batch():
 # ------------------------------------------------------------- compute ops
 
 
-class FakeScores:
-    def __init__(self):
-        self.calls = []
+def score_result(scores, variant, **params):
+    return NS(
+        scores=scores, variant=variant, params=params, warnings=["fake-score-warning"]
+    )
 
-    def h2o_scores(self, q, k, *, scale, causal, q_positions, k_positions, chunk):
+
+class FakeScores:
+    """Mirrors ``compaction_methods.scores``: returns ScoreResult-like objects."""
+
+    def __init__(self, bare=False):
+        self.calls = []
+        self.bare = bare
+
+    def h2o_scores(
+        self,
+        q,
+        k,
+        *,
+        scale,
+        causal,
+        q_positions,
+        k_positions,
+        chunk=2048,
+        memory_budget_bytes=None,
+    ):
         self.calls.append(
             dict(
                 method="h2o",
@@ -561,15 +722,34 @@ class FakeScores:
                 q_positions=q_positions.clone(),
                 k_positions=k_positions.clone(),
                 chunk=chunk,
+                memory_budget_bytes=memory_budget_bytes,
             )
         )
         tokens, heads = k.shape[0], k.shape[1]
-        return (
+        scores = (
             torch.arange(tokens, dtype=torch.float32)[None, :].repeat(heads, 1)
             + 0.5 * torch.arange(heads, dtype=torch.float32)[:, None]
         )
+        if self.bare:
+            return scores
+        return score_result(
+            scores,
+            "h2o_uniform_prefill",
+            chunk=chunk,
+            memory_budget_bytes=memory_budget_bytes,
+        )
 
-    def kvzip_scores(self, q_ref, k, *, scale, k_ref=None, chunk):
+    def kvzip_scores(
+        self,
+        q_ref,
+        k,
+        *,
+        scale,
+        k_ref,
+        chunk=2048,
+        normalisation="paper",
+        memory_budget_bytes=None,
+    ):
         self.calls.append(
             dict(
                 method="kvzip",
@@ -578,9 +758,16 @@ class FakeScores:
                 k_ref=None if k_ref is None else k_ref.clone(),
                 scale=scale,
                 chunk=chunk,
+                normalisation=normalisation,
+                memory_budget_bytes=memory_budget_bytes,
             )
         )
-        return k.float().abs().sum(-1).T
+        variant = "kvzip_uniform_perlayer_fullctx"
+        if normalisation == "context_only":
+            variant += "_ctxonly"
+        return score_result(
+            k.float().abs().sum(-1).T, variant, chunk=chunk, normalisation=normalisation
+        )
 
 
 class FakeSelect:
@@ -610,17 +797,37 @@ class FakeSelect:
 
 
 class FakeAMResult:
-    """Mirrors ``profiling.compaction_methods.am.AMResult`` for the shared case."""
+    """Mirrors ``compaction_methods.am.AMResult`` for the shared case."""
 
-    def __init__(self, chosen, k, v):
+    def __init__(self, chosen, k, v, fixed, *, chunk, budget):
         index = torch.tensor(chosen)
-        self.indices = index[None, :].repeat(k.shape[1], 1)  # [Hkv, t]
+        heads = k.shape[1]
+        self.indices = index[None, :].repeat(heads, 1)  # [Hkv, t]
         self.k_c = k[index].transpose(0, 1).contiguous()  # [Hkv, t, D]
-        self.v_c = (v[index] * 2).transpose(0, 1).contiguous()
+        values = v[index] * 2
+        fixed_rows = torch.tensor([c in fixed for c in chosen], dtype=torch.bool)
+        values[fixed_rows] = v[index][fixed_rows]  # frozen frame rows keep V
+        self.v_c = values.transpose(0, 1).contiguous()
         self.beta = None
+        self.fixed_mask = fixed_rows[None, :].repeat(heads, 1)
         self.shared = True
-        self.variant = "fake_am_rmskeys_ols_nobias_uniform"
-        self.diagnostics = {"output_error_after": torch.zeros(k.shape[1])}
+        self.warnings = ["fake-am-warning"]
+        policy = "fixed" if fixed else "refit"
+        self.variant = (
+            f"fake_am_rmskeys_ols_nobias_uniform_offpolicy_frame{policy}_chol64"
+        )
+        self.diagnostics = {
+            "frame_policy": policy,
+            "n_fixed": len(fixed),
+            "n_protected": len(chosen) - len(fixed) if policy == "refit" else 0,
+            "solver": "cholesky",
+            "accumulate_dtype": "torch.float64",
+            "compute_dtype": "torch.float32",
+            "chunk": chunk,
+            "identity_shortcut": budget == k.shape[0],
+            "output_error_after_rel": [0.0] * heads,
+            "warnings": [],
+        }
 
     def token_indices(self):
         return self.indices[0].tolist()
@@ -636,23 +843,45 @@ class FakeAM:
     def __init__(self):
         self.calls = []
 
-    def compact(self, q_ref, k, v, budget, *, bias, head_budget, protected, **kwargs):
+    def compact(
+        self,
+        q_ref,
+        k,
+        v,
+        budget,
+        *,
+        bias,
+        head_budget,
+        protected,
+        fixed,
+        scale,
+        ridge,
+        chunk=2048,
+        memory_budget_bytes=None,
+    ):
         self.calls.append(
             dict(
                 budget=budget,
                 bias=bias,
                 head_budget=head_budget,
                 protected=list(protected),
-                **kwargs,
+                fixed=list(fixed),
+                scale=scale,
+                ridge=ridge,
+                chunk=chunk,
+                memory_budget_bytes=memory_budget_bytes,
+                v_dtype=v.dtype,
             )
         )
-        chosen = list(protected)
+        chosen = list(protected) + list(fixed)
         for i in range(k.shape[0] - 1, -1, -1):
             if len(chosen) >= budget:
                 break
             if i not in chosen:
                 chosen.append(i)
-        return FakeAMResult(sorted(chosen), k, v)
+        return FakeAMResult(
+            sorted(chosen), k, v, list(fixed), chunk=chunk, budget=budget
+        )
 
 
 @pytest.fixture
@@ -664,14 +893,17 @@ def fakes():
     return bundle
 
 
-def resident_controller(cursor=6):
-    controller, layers, _ = make_controller([("ctx", cursor, 1, None, 2)])
+def resident_controller():
+    """One resident request whose worker cursor copy lags the consumed cursor."""
+    controller, layers, _ = make_controller(
+        [("ctx", LAGGING, 1, None, 2)], consumed={"ctx": CTX}
+    )
     return controller, layers
 
 
-def fill_export(controller, name, token_range, base=0.0):
+def fill_export(controller, name, token_range, base=0.0, request_id="ctx"):
     store = controller.q_store
-    store.open(name, token_range=token_range, request_id="ctx")
+    store.open(name, token_range=token_range, request_id=request_id)
     rows = token_range[1] - token_range[0]
     queries = {}
     for i, layer in enumerate(FA):
@@ -694,13 +926,60 @@ def cache_rows(layer, tokens):
     return layer.kv_cache[blocks, :, offsets, :]
 
 
+def test_resident_ops_use_the_tracked_cursor_and_require_the_expected_cursor(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [2, 6])
+    assert controller.runner.input_batch.num_computed_tokens_cpu == [LAGGING]
+    receipt = controller.kv_score(
+        "S", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    # The default key range covers the consumed prefix, including the last chunk.
+    assert receipt["source"]["key_range"] == [0, CTX]
+    assert (
+        receipt["source"]["cursor"] == CTX
+        and receipt["source"]["expected_cursor"] == CTX
+    )
+    assert fakes.scores.calls[0]["k"].shape[0] == CTX
+    with pytest.raises(CompactionContractError, match="expected_cursor 5 differs"):
+        controller.kv_score(
+            "S2", q_export="Q", method="h2o", request_id="ctx", expected_cursor=5
+        )
+    with pytest.raises(CompactionContractError, match="required for resident"):
+        controller.kv_score("S2", q_export="Q", method="h2o", request_id="ctx")
+    with pytest.raises(CompactionContractError, match="must be an integer"):
+        controller.kv_capture(
+            {"name": "c", "token_indices": [0]}, "ctx", expected_cursor=None
+        )
+    controller._consumed.pop("ctx")
+    with pytest.raises(CompactionContractError, match="No consumed cursor"):
+        controller.kv_score(
+            "S2", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+        )
+    controller._consumed["ctx"] = LAGGING - 1
+    with pytest.raises(CompactionContractError, match="behind the worker copies"):
+        controller.kv_capture(
+            {"name": "c", "token_indices": [0]}, "ctx", expected_cursor=LAGGING - 1
+        )
+
+
 def test_kv_score_h2o_reads_cache_keys_and_stores_float32_cpu_scores(fakes):
     controller, layers = resident_controller()
     queries = fill_export(controller, "Q", [2, 6])
     receipt = controller.kv_score(
-        "S", q_export="Q", method="h2o", request_id="ctx", params={"chunk": 8}
+        "S",
+        q_export="Q",
+        method="h2o",
+        request_id="ctx",
+        expected_cursor=CTX,
+        params={"chunk": 8},
     )
-    assert receipt["method"] == "h2o" and receipt["params"] == {"chunk": 8}
+    assert receipt["method"] == "h2o" and receipt["variant"] == "h2o_uniform_prefill"
+    assert receipt["params"]["chunk"] == 8
+    assert receipt["params"]["blocking"] == {name: {"chunk": 8} for name in FA}
+    assert receipt["params"]["memory_budget"]["policy"] == "default_1GiB"
+    assert receipt["library_params"] == {
+        name: {"chunk": 8, "memory_budget_bytes": None} for name in FA
+    }
     assert receipt["shapes"] == {name: [KV_HEADS, 6] for name in FA}
     assert receipt["source"]["kind"] == "resident_request"
     assert receipt["source"]["key_range"] == [0, 6]
@@ -708,6 +987,7 @@ def test_kv_score_h2o_reads_cache_keys_and_stores_float32_cpu_scores(fakes):
     assert receipt["source"]["scale"] == {name: HEAD**-0.5 for name in FA}
     assert receipt["source"]["k_ref"] is None
     assert receipt["source"]["normalisation"] == "causal_over_scored_keys"
+    assert receipt["source"]["dropped_prefix_keys"] is None
     assert (
         receipt["source"]["query_convention"]["head_order"] == "contiguous_gqa_blocks"
     )
@@ -722,6 +1002,7 @@ def test_kv_score_h2o_reads_cache_keys_and_stores_float32_cpu_scores(fakes):
         assert torch.equal(call["k"], cache_rows(layers[name], range(6))[..., :HEAD])
         assert torch.equal(call["q"], queries[name])
         assert (call["scale"], call["causal"], call["chunk"]) == (HEAD**-0.5, True, 8)
+        assert call["memory_budget_bytes"] is None
         assert call["q_positions"].tolist() == [2, 3, 4, 5]
         assert call["k_positions"].tolist() == list(range(6))
     assert controller.score_store.key_token_indices("S") == {
@@ -729,93 +1010,255 @@ def test_kv_score_h2o_reads_cache_keys_and_stores_float32_cpu_scores(fakes):
     }
     listed = controller.scores()["scores"]["S"]
     assert listed["keys_per_layer"] == {name: 6 for name in FA}
-    assert "layers" not in listed
-    assert controller.score_drop("S")["scores"] == {}
+    assert "layers" not in listed and listed["variant"] == "h2o_uniform_prefill"
+    assert listed["library_warnings"] == {name: ["fake-score-warning"] for name in FA}
+    # Without an explicit chunk the memory budget is forwarded instead.
+    budgeted = controller.kv_score(
+        "B", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    assert budgeted["params"]["blocking"] == {
+        name: {"memory_budget_bytes": 1 << 30} for name in FA
+    }
+    assert fakes.scores.calls[-1]["memory_budget_bytes"] == 1 << 30
+    explicit = controller.kv_score(
+        "E",
+        q_export="Q",
+        method="h2o",
+        request_id="ctx",
+        expected_cursor=CTX,
+        params={"memory_budget_bytes": 4096},
+    )
+    assert explicit["params"]["memory_budget"] == {
+        "bytes": 4096,
+        "policy": "caller",
+        "free_bytes": None,
+    }
+    assert fakes.scores.calls[-1]["memory_budget_bytes"] == 4096
+    assert controller.score_drop("S")["scores"].keys() == {"B", "E"}
 
 
-def test_kv_score_kvzip_from_per_layer_snapshot_keeps_each_layers_key_indices(fakes):
+def test_bare_score_tensors_are_accepted_and_named_by_method(fakes):
+    compaction_q.register_methods(scores=FakeScores(bare=True))
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    receipt = controller.kv_score(
+        "S", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    assert receipt["variant"] is None and receipt["library_params"] == {
+        name: None for name in FA
+    }
+    selected = controller.kv_select(
+        "sel", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+    )
+    assert selected["variant"] == "h2o_uniform"
+    assert selected["method"]["name"] == "h2o_uniform"
+
+
+def test_kv_score_kvzip_paper_normaliser_needs_the_contiguous_prefix(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [4, 6])  # repeat rows 4, 5 of "ctx"
+    for bad in ([0, 3], [0, 6], [1, 4]):
+        with pytest.raises(
+            CompactionContractError, match="key_range == \\[0, repeat_start\\]"
+        ):
+            controller.kv_score(
+                "Z",
+                q_export="Q",
+                method="kvzip",
+                request_id="ctx",
+                expected_cursor=CTX,
+                key_range=bad,
+            )
+    receipt = controller.kv_score(
+        "Z", q_export="Q", method="kvzip", request_id="ctx", expected_cursor=CTX
+    )
+    assert receipt["source"]["key_range"] == [0, 4]
+    assert receipt["source"]["normalisation"] == "context_plus_causal_repeat_keys"
+    assert receipt["source"]["k_ref"] == {"request_id": "ctx", "token_range": [4, 6]}
+    assert receipt["variant"] == "kvzip_uniform_perlayer_fullctx"
+    for call, name in zip(fakes.scores.calls, FA):
+        assert call["method"] == "kvzip" and call["normalisation"] == "paper"
+        assert torch.equal(call["k"], cache_rows(layers[name], range(4))[..., :HEAD])
+        # k_ref reaches the last chunk (tokens 4, 5) beyond the lagging worker copy.
+        assert torch.equal(call["k_ref"], cache_rows(layers[name], [4, 5])[..., :HEAD])
+    explicit = controller.kv_score(
+        "Z2",
+        q_export="Q",
+        method="kvzip",
+        request_id="ctx",
+        expected_cursor=CTX,
+        key_range=[0, 4],
+    )
+    assert explicit["source"]["key_range"] == [0, 4]
+
+
+def test_kv_score_kvzip_from_a_snapshot_labels_the_normaliser_and_counts_dropped_keys(
+    fakes,
+):
     controller, layers = resident_controller()
     fill_export(controller, "Q", [4, 6])
-    row, metadata, computed = controller._resident("ctx")
+    row, metadata, computed = controller._resident("ctx", expected_cursor=CTX)
     controller.kv_store.capture(
-        {"name": "snap", "layer_token_indices": {"fa0": [0, 1, 5], "fa1": [2, 3, 4]}},
+        {"name": "snap", "layer_token_indices": {"fa0": [0, 1, 3], "fa1": [1, 2, 3]}},
         "ctx",
         row,
         metadata,
         computed,
     )
-    receipt = controller.kv_score("S", q_export="Q", method="kvzip", kv_snapshot="snap")
+    with pytest.raises(CompactionContractError, match="required for snapshot"):
+        controller.kv_score("S", q_export="Q", method="kvzip", kv_snapshot="snap")
+    with pytest.raises(CompactionContractError, match="differs from the snapshot"):
+        controller.kv_score(
+            "S", q_export="Q", method="kvzip", kv_snapshot="snap", expected_cursor=5
+        )
+    receipt = controller.kv_score(
+        "S", q_export="Q", method="kvzip", kv_snapshot="snap", expected_cursor=CTX
+    )
     assert receipt["source"]["kind"] == "kv_snapshot"
+    assert receipt["source"]["expected_cursor"] == CTX
+    assert receipt["library_warnings"] == {name: ["fake-score-warning"] for name in FA}
     assert receipt["source"]["name"] == "snap" and receipt["source"]["cursor"] == 6
+    assert receipt["source"]["normalisation"] == "snapshot_plus_causal_repeat_keys"
+    assert receipt["source"]["dropped_prefix_keys"] == {"fa0": 1, "fa1": 1}
     assert controller.score_store.key_token_indices("S") == {
-        "fa0": [0, 1, 5],
-        "fa1": [2, 3, 4],
+        "fa0": [0, 1, 3],
+        "fa1": [1, 2, 3],
     }
-    # k_ref = the repeat request's own keys for its exported rows (tokens 4, 5).
-    assert receipt["source"]["k_ref"] == {"request_id": "ctx", "token_range": [4, 6]}
-    assert receipt["source"]["normalisation"] == "context_plus_causal_repeat_keys"
-    assert receipt["params"] == {"chunk": compaction_q.DEFAULT_CHUNK}
     for call, name in zip(fakes.scores.calls, FA):
-        assert call["method"] == "kvzip" and call["chunk"] == compaction_q.DEFAULT_CHUNK
         assert torch.equal(
             call["k"], controller.kv_store.snapshot_rows("snap")[name][..., :HEAD]
         )
         assert torch.equal(call["k_ref"], cache_rows(layers[name], [4, 5])[..., :HEAD])
     with pytest.raises(CompactionContractError, match="same key tokens"):
-        controller.kv_select("sel", scores="S", budget_tokens=2)
-    # Without k_ref the library's named deviation must be opted into explicitly.
-    controller.q_store.drop("Q")
-    controller.q_store.open("Q", token_range=[4, 6])  # no request bound
-    for layer in FA:
-        controller.q_store.write("Q", layer, query_batch(2), 4)
-    controller.q_store.commit(
-        "Q",
-        cursor_start=4,
-        cursor_end=6,
-        positions=torch.arange(4, 6),
-        layers_written=set(FA),
-        receipt={},
+        controller.kv_select(
+            "sel", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+        )
+    # Snapshot keys inside the repeat range would be counted twice: refused.
+    controller.kv_store.capture(
+        {"name": "overlap", "token_indices": [0, 5]}, "ctx", row, metadata, computed
     )
+    with pytest.raises(CompactionContractError, match="overlap the repeat rows"):
+        controller.kv_score(
+            "S2",
+            q_export="Q",
+            method="kvzip",
+            kv_snapshot="overlap",
+            expected_cursor=CTX,
+        )
+    # The context-only deviation must be opted into explicitly and is labelled.
+    controller.q_store.drop("Q")
+    fill_export(controller, "Q", [4, 6], request_id=None)
     with pytest.raises(CompactionContractError, match="k_ref"):
-        controller.kv_score("S3", q_export="Q", method="kvzip", kv_snapshot="snap")
+        controller.kv_score(
+            "S3", q_export="Q", method="kvzip", kv_snapshot="snap", expected_cursor=CTX
+        )
     deviation = controller.kv_score(
         "S3",
         q_export="Q",
         method="kvzip",
         kv_snapshot="snap",
+        expected_cursor=CTX,
         params={"context_only_normalisation": True},
     )
     assert deviation["source"]["normalisation"] == "context_only"
+    assert deviation["variant"] == "kvzip_uniform_perlayer_fullctx_ctxonly"
     assert fakes.scores.calls[-1]["k_ref"] is None
-    with pytest.raises(CompactionContractError, match="resident requests only"):
+    assert fakes.scores.calls[-1]["normalisation"] == "context_only"
+
+
+def test_h2o_with_a_snapshot_source_requires_the_exports_request(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    row, metadata, computed = controller._resident("ctx", expected_cursor=CTX)
+    controller.kv_store.capture(
+        {"name": "mine", "token_indices": [0, 1, 2]}, "ctx", row, metadata, computed
+    )
+    controller.kv_store.capture(
+        {"name": "theirs", "token_indices": [0, 1, 2]}, "other", row, metadata, computed
+    )
+    ok = controller.kv_score(
+        "S", q_export="Q", method="h2o", kv_snapshot="mine", expected_cursor=CTX
+    )
+    assert ok["source"]["kind"] == "kv_snapshot" and ok["source"]["request_id"] == "ctx"
+    with pytest.raises(CompactionContractError, match="same request"):
         controller.kv_score(
-            "S2", q_export="Q", method="kvzip", kv_snapshot="snap", key_range=[0, 2]
+            "S2", q_export="Q", method="h2o", kv_snapshot="theirs", expected_cursor=CTX
         )
 
 
-def test_kv_select_returns_equal_counts_capture_spec_and_keeps_protected(fakes):
+def test_kv_select_requires_policy_and_aggregate_and_returns_a_method_record(fakes):
     controller, layers = resident_controller()
     fill_export(controller, "Q", [0, 6])
-    controller.kv_score("S", q_export="Q", method="h2o", request_id="ctx")
-    shared = controller.kv_select("shared", scores="S", budget_tokens=3, protected=[0])
+    controller.kv_score(
+        "S", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    with pytest.raises(TypeError):
+        controller.kv_select("x", scores="S", budget_tokens=3)
+    with pytest.raises(CompactionContractError, match="Unknown selection policy"):
+        controller.kv_select(
+            "x", scores="S", budget_tokens=3, policy="top", aggregate="max"
+        )
+    shared = controller.kv_select(
+        "shared",
+        scores="S",
+        budget_tokens=3,
+        policy="shared",
+        aggregate="max",
+        protected=[0],
+    )
     assert shared["token_indices"] == [0, 4, 5]
     assert shared["retained_tokens"] == 3 and shared["scored_tokens"] == 6
     assert shared["layer_token_indices"] == {name: [0, 4, 5] for name in FA}
-    assert shared["capture_spec"] == {"name": "shared", "token_indices": [0, 4, 5]}
-    assert shared["method"] == "h2o" and shared["layer_order"] == list(FA)
+    assert (
+        shared["score_method"] == "h2o" and shared["variant"] == "h2o_uniform_prefill"
+    )
+    assert shared["layer_order"] == list(FA)
+    method = shared["method"]
+    assert method["name"] == "h2o_uniform_prefill"
+    assert (
+        method["params"]["policy"] == "shared"
+        and method["params"]["aggregate"] == "max"
+    )
+    assert (
+        method["params"]["protected"] == [0] and method["params"]["budget_tokens"] == 3
+    )
+    assert method["params"]["score_method"] == "h2o"
+    assert method["params"]["library_params"]["fa0"]["memory_budget_bytes"] == 1 << 30
+    assert method["inputs"]["scores"] == "S" and method["inputs"]["q_export"] == "Q"
+    assert method["inputs"]["source"]["kind"] == "resident_request"
+    library = method["inputs"]["library"]
+    assert set(library) == {
+        "package",
+        "path",
+        "commit",
+        "dirty",
+        "registered_override",
+        "error",
+    }
+    assert library["registered_override"] == ["am", "scores", "select"]
+    assert shared["capture_spec"] == {
+        "name": "shared",
+        "token_indices": [0, 4, 5],
+        "method": method,
+    }
     assert fakes.select.calls[-1] == {"budget": 3, "protected": [0]}
+    snapshot = controller.kv_capture(shared["capture_spec"], "ctx", expected_cursor=CTX)
+    assert snapshot["method"] == method and snapshot["synthetic"] is False
+    assert snapshot["selection_policy"] == "shared" and snapshot["source_cursor"] == CTX
     per_layer = controller.kv_select(
         "pl", scores="S", budget_tokens=2, policy="per_layer", aggregate="mean"
     )
     assert per_layer["token_indices"] is None
-    assert per_layer["capture_spec"] == {
-        "name": "pl",
-        "layer_token_indices": {name: [4, 5] for name in FA},
+    assert per_layer["capture_spec"]["layer_token_indices"] == {
+        name: [4, 5] for name in FA
     }
-    snapshot = controller.kv_capture(per_layer["capture_spec"], "ctx")
-    assert snapshot["selection_policy"] == "per_layer"
-    assert snapshot["retained_tokens"] == 2 and snapshot["source_cursor"] == 6
-    assert snapshot["source_position_offset"] == 0
+    assert per_layer["capture_spec"]["method"]["params"]["policy"] == "per_layer"
+    snapshot = controller.kv_capture(
+        per_layer["capture_spec"], "ctx", expected_cursor=CTX
+    )
+    assert (
+        snapshot["selection_policy"] == "per_layer" and snapshot["retained_tokens"] == 2
+    )
     for name in FA:
         assert torch.equal(
             controller.kv_store.snapshot_rows("pl")[name],
@@ -823,16 +1266,34 @@ def test_kv_select_returns_equal_counts_capture_spec_and_keeps_protected(fakes):
         )
     assert set(controller.kv_selections()["selections"]) == {"shared", "pl"}
     with pytest.raises(CompactionContractError, match="not among the scored keys"):
-        controller.kv_select("x", scores="S", budget_tokens=2, protected=[9])
+        controller.kv_select(
+            "x",
+            scores="S",
+            budget_tokens=2,
+            policy="shared",
+            aggregate="max",
+            protected=[9],
+        )
     with pytest.raises(CompactionContractError, match="overwritten"):
-        controller.kv_select("shared", scores="S", budget_tokens=2)
-    with pytest.raises(CompactionContractError, match="policy or aggregate"):
-        controller.kv_select("y", scores="S", budget_tokens=2, policy="top")
+        controller.kv_select(
+            "shared", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+        )
     with pytest.raises(CompactionContractError, match="exceeds budget"):
-        controller.kv_select("z", scores="S", budget_tokens=1, protected=[0, 1])
+        controller.kv_select(
+            "z",
+            scores="S",
+            budget_tokens=1,
+            policy="shared",
+            aggregate="max",
+            protected=[0, 1],
+        )
+    with pytest.raises(CompactionContractError, match="exceeds the scored keys"):
+        controller.kv_select(
+            "big", scores="S", budget_tokens=7, policy="shared", aggregate="max"
+        )
 
 
-def test_kv_fit_am_registers_original_keys_with_fitted_values_that_import(fakes):
+def test_kv_fit_am_freezes_frame_tokens_and_records_fit_metadata(fakes):
     controller, layers = resident_controller()
     fill_export(controller, "Q", [0, 6])
     receipt = controller.kv_fit_am(
@@ -840,58 +1301,66 @@ def test_kv_fit_am_registers_original_keys_with_fitted_values_that_import(fakes)
         q_export="Q",
         budget_tokens=3,
         request_id="ctx",
+        expected_cursor=CTX,
         protected=[1],
         params={"ridge": 0.1},
     )
     assert receipt["synthetic"] is True
-    assert receipt["method"]["name"] == "fake_am_rmskeys_ols_nobias_uniform"
-    assert receipt["method"]["alias"] == "am_nobias_uniform"
-    params = receipt["method"]["params"]
+    method = receipt["method"]
+    assert method["name"].endswith("_framefixed_chol64")
+    assert method["alias"] == "am_nobias_uniform"
+    params = method["params"]
     assert (params["ridge"], params["bias"], params["head_budget"]) == (
         0.1,
         False,
         "uniform",
     )
     assert params["protected"] == [1] and params["budget_tokens"] == 3
-    assert params["chunk"] == compaction_q.DEFAULT_CHUNK
-    assert params["scale"] == {name: HEAD**-0.5 for name in FA}
+    assert params["frame_policy"] == "fixed"
+    assert params["fixed_tokens"] == {name: [1] for name in FA}
+    assert params["n_fixed"] == {name: 1 for name in FA}
+    assert params["n_protected"] == {name: 0 for name in FA}
+    assert (params["solver"], params["accumulate_dtype"]) == (
+        "cholesky",
+        "torch.float64",
+    )
+    assert params["compute_dtype"] == "torch.float32"
+    assert params["fit_value_dtype"] == "torch.float32"
     assert params["values_cast"] == ["torch.float32->torch.float32"]
-    inputs = receipt["method"]["inputs"]
-    assert inputs["q_export"] == "Q" and inputs["kv_digests"] is None
-    assert inputs["source"]["kind"] == "resident_request"
-    assert inputs["query_convention"]["stage"] == "post_qk_norm_post_rope_unscaled"
-    assert receipt["method"]["diagnostics"] == {
-        name: {"output_error_after": [0.0, 0.0]} for name in FA
+    assert params["cast_error"] == {
+        name: {"max_abs": 0.0, "rel_fro": 0.0} for name in FA
     }
+    assert params["blocking"] == {name: {"memory_budget_bytes": 1 << 30} for name in FA}
+    assert params["identity_shortcut"] == {name: False for name in FA}
+    for name in FA:
+        error = params["output_error_after_cast"][name]
+        assert len(error["rel"]) == KV_HEADS and error["max_rel"] >= 0.0
+    assert params["output_error_after_rel_library"] == {name: [0.0, 0.0] for name in FA}
+    assert params["library_warnings"] == {name: ["fake-am-warning"] for name in FA}
+    assert params["warnings"] == {name: [] for name in FA}
+    inputs = method["inputs"]
+    assert inputs["q_export"] == "Q" and inputs["kv_digests"] is None
+    assert inputs["q_digest"] is None and inputs["q_digest_policy"] == "not_computed"
+    assert inputs["source"]["kind"] == "resident_request"
+    assert inputs["source"]["expected_cursor"] == CTX
+    assert inputs["query_convention"]["stage"] == "post_qk_norm_post_rope_unscaled"
+    assert inputs["library"]["registered_override"] == ["am", "scores", "select"]
     assert receipt["layer_token_indices"] == {name: [1, 4, 5] for name in FA}
     assert receipt["selection_policy"] == "per_layer"
-    assert (receipt["retained_tokens"], receipt["source_cursor"]) == (3, 6)
+    assert (receipt["retained_tokens"], receipt["source_cursor"]) == (3, CTX)
     assert receipt["source_position_offset"] == 0 and receipt["request_id"] == "ctx"
-    assert params["protected_values"] == "original"
+    call = fakes.am.calls[0]
+    assert (call["fixed"], call["protected"]) == ([1], [])
+    assert (call["budget"], call["ridge"], call["bias"]) == (3, 0.1, False)
+    assert (call["scale"], call["memory_budget_bytes"]) == (HEAD**-0.5, 1 << 30)
+    assert call["v_dtype"] == torch.float32
     rows = controller.kv_store.snapshot_rows("AM")
     for name in FA:
         source = cache_rows(layers[name], [1, 4, 5])
         assert torch.equal(rows[name][..., :HEAD], source[..., :HEAD])
-        # Protected token 1 keeps its original values; the others carry the fit.
+        # Frozen token 1 keeps its original values; the others carry the fit.
         assert torch.equal(rows[name][0, :, HEAD:], source[0, :, HEAD:])
         assert torch.equal(rows[name][1:, :, HEAD:], source[1:, :, HEAD:] * 2)
-    refit = controller.kv_fit_am(
-        "AMrefit",
-        q_export="Q",
-        budget_tokens=2,
-        request_id="ctx",
-        protected=[1],
-        params={"refit_protected": True},
-    )
-    assert refit["method"]["params"]["protected_values"] == "fitted"
-    for name in FA:
-        source = cache_rows(layers[name], [1, 5])
-        refit_rows = controller.kv_store.snapshot_rows("AMrefit")[name]
-        assert torch.equal(refit_rows[..., HEAD:], source[..., HEAD:] * 2)
-    call = fakes.am.calls[0]
-    assert (call["budget"], call["protected"], call["ridge"]) == (3, [1], 0.1)
-    assert (call["bias"], call["head_budget"]) == (False, "uniform")
-    assert (call["scale"], call["chunk"]) == (HEAD**-0.5, compaction_q.DEFAULT_CHUNK)
     # Import through the unchanged restore path into a fresh row.
     metadata = {
         name: NS(
@@ -908,24 +1377,37 @@ def test_kv_fit_am_registers_original_keys_with_fitted_values_that_import(fakes)
             layers[name].kv_cache[3, :, :3, :].transpose(0, 1), rows[name]
         )
         assert torch.all(layers[name].kv_cache[3, :, 3:, :] == -7)
-    digested = controller.kv_fit_am(
-        "AM2",
+    refit = controller.kv_fit_am(
+        "AMrefit",
         q_export="Q",
         budget_tokens=2,
         request_id="ctx",
-        params={"digest_inputs": True},
+        expected_cursor=CTX,
+        protected=[1],
+        params={"refit_protected": True, "digest_inputs": True, "output_error": False},
     )
-    assert set(digested["method"]["inputs"]["kv_digests"]) == set(FA)
+    assert fakes.am.calls[-1]["fixed"] == [] and fakes.am.calls[-1]["protected"] == [1]
+    assert refit["method"]["params"]["frame_policy"] == "refit"
+    assert refit["method"]["params"]["fixed_tokens"] == {name: [] for name in FA}
+    assert refit["method"]["params"]["output_error_after_cast"] is None
+    assert set(refit["method"]["inputs"]["kv_digests"]) == set(FA)
+    assert isinstance(refit["method"]["inputs"]["q_digest"], str)
+    assert refit["method"]["inputs"]["q_digest_policy"] == "computed"
+    for name in FA:
+        source = cache_rows(layers[name], [1, 5])
+        refit_rows = controller.kv_store.snapshot_rows("AMrefit")[name]
+        assert torch.equal(refit_rows[..., HEAD:], source[..., HEAD:] * 2)
 
 
 def test_compute_ops_fail_closed_on_missing_library_and_bad_outputs(monkeypatch):
     controller, layers = resident_controller()
     fill_export(controller, "Q", [0, 6])
+    common = dict(q_export="Q", request_id="ctx", expected_cursor=CTX)
     monkeypatch.setattr(
         compaction_q, "METHODS_PACKAGE", "profiling_missing_for_test.compaction_methods"
     )
     with pytest.raises(CompactionContractError, match="unavailable"):
-        controller.kv_score("S", q_export="Q", method="h2o", request_id="ctx")
+        controller.kv_score("S", method="h2o", **common)
     assert controller.scores()["scores"] == {}
     bad_outputs = {
         "shape": lambda q, k, **kw: torch.zeros(3, 3),
@@ -935,48 +1417,56 @@ def test_compute_ops_fail_closed_on_missing_library_and_bad_outputs(monkeypatch)
     for label, fake in bad_outputs.items():
         compaction_q.register_methods(scores=NS(h2o_scores=fake, kvzip_scores=fake))
         with pytest.raises(CompactionContractError, match="finite"):
-            controller.kv_score(label, q_export="Q", method="h2o", request_id="ctx")
+            controller.kv_score(label, method="h2o", **common)
+    compaction_q.register_methods(
+        scores=NS(
+            h2o_scores=lambda q, k, **kw: NS(scores=torch.zeros(2, 6), variant="")
+        )
+    )
+    with pytest.raises(CompactionContractError, match="ScoreResult"):
+        controller.kv_score("S", method="h2o", **common)
     assert controller.scores()["scores"] == {}
     compaction_q.register_methods(scores=FakeScores())
     with pytest.raises(CompactionContractError, match="Unknown scoring method"):
-        controller.kv_score("S", q_export="Q", method="snapkv", request_id="ctx")
-    with pytest.raises(CompactionContractError, match="Unknown score params"):
-        controller.kv_score(
-            "S", q_export="Q", method="h2o", request_id="ctx", params={"temperature": 1}
-        )
+        controller.kv_score("S", method="snapkv", **common)
+    for bad_params in ({"temperature": 1}, {"causal": False}):
+        with pytest.raises(CompactionContractError, match="Unknown score params"):
+            controller.kv_score("S", method="h2o", params=bad_params, **common)
     with pytest.raises(CompactionContractError, match="exactly one of"):
         controller.kv_score("S", q_export="Q", method="h2o")
     with pytest.raises(CompactionContractError, match="not resident"):
-        controller.kv_score("S", q_export="Q", method="h2o", request_id="ghost")
-    with pytest.raises(CompactionContractError, match="exceeds the consumed prefix"):
         controller.kv_score(
-            "S", q_export="Q", method="h2o", request_id="ctx", key_range=[0, 7]
+            "S", q_export="Q", method="h2o", request_id="ghost", expected_cursor=CTX
         )
+    with pytest.raises(CompactionContractError, match="exceeds the consumed prefix"):
+        controller.kv_score("S", method="h2o", key_range=[0, 7], **common)
     controller.q_store.open("P", token_range=[0, 6], request_id="ctx")
     with pytest.raises(CompactionContractError, match="incomplete"):
-        controller.kv_score("S", q_export="P", method="h2o", request_id="ctx")
+        controller.kv_score(
+            "S", q_export="P", method="h2o", request_id="ctx", expected_cursor=CTX
+        )
     controller.runner.execute_model_state = object()
     with pytest.raises(CompactionContractError, match="between forward and sampling"):
-        controller.kv_score("S", q_export="Q", method="h2o", request_id="ctx")
+        controller.kv_score("S", method="h2o", **common)
     controller.runner.execute_model_state = None
-    controller.kv_score("S", q_export="Q", method="h2o", request_id="ctx")
+    controller.kv_score("S", method="h2o", **common)
     with pytest.raises(CompactionContractError, match="overwritten"):
-        controller.kv_score("S", q_export="Q", method="h2o", request_id="ctx")
+        controller.kv_score("S", method="h2o", **common)
     # Selection library outputs are validated too.
     compaction_q.register_methods(
         select=NS(uniform_token_budget=lambda s, b, **kw: [[0] for _ in s])
     )
     with pytest.raises(CompactionContractError, match="match the budget"):
-        controller.kv_select("sel", scores="S", budget_tokens=2)
+        controller.kv_select(
+            "sel", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+        )
     compaction_q.register_methods(
         select=NS(uniform_token_budget=lambda s, b, **kw: [[0, 1], [2, 3]])
     )
     with pytest.raises(CompactionContractError, match="identical layer lists"):
-        controller.kv_select("sel", scores="S", budget_tokens=2, policy="shared")
-    compaction_q.register_methods(select=FakeSelect())
-    with pytest.raises(CompactionContractError, match="exceeds the scored keys"):
-        controller.kv_select("big", scores="S", budget_tokens=7)
-    # Library exceptions surface as contract errors with their origin.
+        controller.kv_select(
+            "sel", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+        )
     compaction_q.register_methods(
         select=NS(
             uniform_token_budget=lambda *a, **kw: (_ for _ in ()).throw(
@@ -987,17 +1477,40 @@ def test_compute_ops_fail_closed_on_missing_library_and_bad_outputs(monkeypatch)
     with pytest.raises(
         CompactionContractError, match="uniform_token_budget failed.*boom"
     ):
-        controller.kv_select("sel", scores="S", budget_tokens=2)
+        controller.kv_select(
+            "sel", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+        )
     assert controller.kv_selections()["selections"] == {}
 
-    # AM outputs are validated: beta, shared layout, counts, keys, value shapes.
-    def am_result(k, v, chosen, *, beta=None, k_shift=0.0, v_cols=None, shared=True):
+    # AM outputs are validated: beta, shared layout, counts, keys, fixed rows, values.
+    def am_result(
+        k,
+        v,
+        chosen,
+        *,
+        beta=None,
+        k_shift=0.0,
+        v_cols=None,
+        shared=True,
+        fixed_mask="auto",
+        fixed=(),
+        v_shift_fixed=0.0,
+    ):
         rows_k = k[chosen] + k_shift
-        rows_v = v[chosen] if v_cols is None else v[chosen][..., :v_cols]
+        rows_v = v[chosen].clone() if v_cols is None else v[chosen][..., :v_cols]
+        mask_rows = torch.tensor([c in fixed for c in chosen], dtype=torch.bool)
+        if v_cols is None and v_shift_fixed:
+            rows_v[mask_rows] += v_shift_fixed
+        mask = (
+            mask_rows[None, :].repeat(k.shape[1], 1)
+            if fixed_mask == "auto"
+            else fixed_mask
+        )
         return NS(
             beta=beta,
             shared=shared,
             variant="fake",
+            fixed_mask=mask,
             diagnostics={},
             token_indices=lambda: list(chosen),
             cache_layout=lambda: (rows_k, rows_v),
@@ -1009,59 +1522,360 @@ def test_compute_ops_fail_closed_on_missing_library_and_bad_outputs(monkeypatch)
         "count": (lambda k, v: am_result(k, v, [0]), "match the budget"),
         "keys": (lambda k, v: am_result(k, v, [0, 1], k_shift=1.0), "original keys"),
         "values": (lambda k, v: am_result(k, v, [0, 1], v_cols=1), "AM v_c"),
+        "nomask": (
+            lambda k, v: am_result(k, v, [0, 1], fixed=(0,), fixed_mask=None),
+            "lacks fixed_mask",
+        ),
+        "maskset": (
+            lambda k, v: am_result(k, v, [0, 1], fixed=(1,)),
+            "fixed_mask marks",
+        ),
+        "frozen": (
+            lambda k, v: am_result(k, v, [0, 1], fixed=(0,), v_shift_fixed=1.0),
+            "fixed rows",
+        ),
     }
     for build, message in faults.values():
         compaction_q.register_methods(
             am=NS(compact=lambda q, k, v, b, build=build, **kw: build(k, v))
         )
         with pytest.raises(CompactionContractError, match=message):
-            controller.kv_fit_am("AM", q_export="Q", budget_tokens=2, request_id="ctx")
+            controller.kv_fit_am("AM", budget_tokens=2, protected=[0], **common)
     compaction_q.register_methods(am=FakeAM())
     with pytest.raises(CompactionContractError, match="exceeds the source keys"):
-        controller.kv_fit_am("AM", q_export="Q", budget_tokens=7, request_id="ctx")
-    with pytest.raises(CompactionContractError, match="Unknown am params"):
-        controller.kv_fit_am(
-            "AM", q_export="Q", budget_tokens=2, request_id="ctx", params={"iters": 3}
-        )
+        controller.kv_fit_am("AM", budget_tokens=7, **common)
+    for bad_params in ({"iters": 3}, {"mass_weighting": "shifted"}):
+        with pytest.raises(CompactionContractError, match="Unknown am params"):
+            controller.kv_fit_am("AM", budget_tokens=2, params=bad_params, **common)
     assert controller.kv_store.list()["snapshots"] == {}
 
 
 def test_kv_capture_of_a_resident_request_matches_boundary_capture_semantics():
     controller, layers = resident_controller()
-    receipt = controller.kv_capture({"name": "res", "token_indices": [0, 3, 5]}, "ctx")
-    assert receipt["request_id"] == "ctx" and receipt["source_cursor"] == 6
+    receipt = controller.kv_capture(
+        {"name": "res", "token_indices": [0, 3, 5]}, "ctx", expected_cursor=CTX
+    )
+    assert receipt["request_id"] == "ctx" and receipt["source_cursor"] == CTX
     assert receipt["selection_policy"] == "shared" and receipt["synthetic"] is False
+    assert receipt["method"] is None
     for name in FA:
         assert torch.equal(
             controller.kv_store.snapshot_rows("res")[name],
             cache_rows(layers[name], [0, 3, 5]),
         )
     controller._position_rules["ctx"] = (2, 40)
-    offset = controller.kv_capture({"name": "off", "token_indices": [0]}, "ctx")
-    assert offset["source_position_offset"] == 40
+    method = {"name": "streamingllm", "params": {"recent": 2}, "inputs": {}}
+    offset = controller.kv_capture(
+        {"name": "off", "token_indices": [0], "method": method},
+        "ctx",
+        expected_cursor=CTX,
+    )
+    assert offset["source_position_offset"] == 40 and offset["method"] == method
+    with pytest.raises(ValueError, match="method must carry"):
+        controller.kv_capture(
+            {"name": "bad", "token_indices": [0], "method": {"name": "x"}},
+            "ctx",
+            expected_cursor=CTX,
+        )
     with pytest.raises(ValueError, match="indices"):
-        controller.kv_capture({"name": "late", "token_indices": [6]}, "ctx")
+        controller.kv_capture(
+            {"name": "late", "token_indices": [6]}, "ctx", expected_cursor=CTX
+        )
     controller.arm(
         expected_prompt_tokens=9,
         capture_kv={"name": "pending", "token_indices": [0]},
     )
     with pytest.raises(CompactionContractError, match="reserved by another operation"):
-        controller.kv_capture({"name": "pending", "token_indices": [0]}, "ctx")
+        controller.kv_capture(
+            {"name": "pending", "token_indices": [0]}, "ctx", expected_cursor=CTX
+        )
+    # A failed operation releases its reservation.
+    controller.operation.failed = "RuntimeError: kernel failed"
+    controller.kv_capture(
+        {"name": "pending", "token_indices": [0]}, "ctx", expected_cursor=CTX
+    )
+    assert controller.kv_drop("pending")["snapshots"].keys() == {"res", "off"}
 
 
 def test_scale_is_head_size_rule_cross_checked_against_the_kernel(fakes):
     controller, layers = resident_controller()
     fill_export(controller, "Q", [0, 6])
     layers["fa0"].impl.scale = 0.5  # a kernel scale that is not head_size ** -0.5
+    common = dict(q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX)
     with pytest.raises(CompactionContractError, match="differs from head_size"):
-        controller.kv_score("S", q_export="Q", method="h2o", request_id="ctx")
+        controller.kv_score("S", **common)
     assert controller.scores()["scores"] == {} and fakes.scores.calls == []
-    receipt = controller.kv_score(
-        "S", q_export="Q", method="h2o", request_id="ctx", params={"scale": 0.5}
-    )
+    receipt = controller.kv_score("S", params={"scale": 0.5}, **common)
     assert receipt["source"]["scale"] == {name: 0.5 for name in FA}
     assert all(call["scale"] == 0.5 for call in fakes.scores.calls)
     with pytest.raises(CompactionContractError, match="positive number"):
-        controller.kv_score(
-            "S2", q_export="Q", method="h2o", request_id="ctx", params={"scale": -1}
+        controller.kv_score("S2", params={"scale": -1}, **common)
+
+
+# ---------------------------------------------------------- real library
+
+
+def test_real_methods_library_contract_on_tiny_tensors():
+    """Resolve the committed ``profiling.compaction_methods`` from the repo root.
+
+    This is the contract-drift guard: it fails (not skips) when the package is
+    missing or its API no longer matches what the fork passes.
+    """
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    try:
+        library = compaction_q.resolve_methods("scores")
+    except CompactionContractError as error:
+        pytest.fail(f"real methods library unavailable at {REPO_ROOT}: {error}")
+    assert library.__name__ == "profiling.compaction_methods.scores"
+    controller, layers = resident_controller()
+    generator = torch.Generator().manual_seed(0)
+    for layer in layers.values():
+        layer.kv_cache.copy_(torch.randn(layer.kv_cache.shape, generator=generator))
+    fill_export(controller, "Q", [0, 6])
+    for name in FA:
+        controller.q_store._entries["Q"]["tensors"][name].copy_(
+            torch.randn(6, Q_HEADS, HEAD, generator=generator)
         )
+    h2o = controller.kv_score(
+        "S", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    assert h2o["variant"] == "h2o_uniform_prefill"
+    assert h2o["library_params"]["fa0"]["memory_budget_bytes"] == 1 << 30
+    for tensor in controller.score_store.tensors("S").values():
+        # Each query contributes unit mass per kv head (mean over the G heads).
+        assert torch.allclose(
+            tensor.sum(dim=1), torch.full((KV_HEADS,), 6.0), atol=1e-4
+        )
+    selection = controller.kv_select(
+        "sel",
+        scores="S",
+        budget_tokens=3,
+        policy="per_layer",
+        aggregate="mean",
+        protected=[0],
+    )
+    assert selection["method"]["name"] == "h2o_uniform_prefill"
+    assert selection["method"]["inputs"]["library"]["path"].endswith(
+        "compaction_methods"
+    )
+    snapshot = controller.kv_capture(
+        selection["capture_spec"], "ctx", expected_cursor=CTX
+    )
+    assert snapshot["method"]["name"] == "h2o_uniform_prefill"
+    fill_export(controller, "R", [4, 6])
+    kvzip = controller.kv_score(
+        "Z", q_export="R", method="kvzip", request_id="ctx", expected_cursor=CTX
+    )
+    assert kvzip["variant"] == "kvzip_uniform_perlayer_fullctx"
+    assert kvzip["source"]["key_range"] == [0, 4]
+    for tensor in controller.score_store.tensors("Z").values():
+        assert ((tensor >= 0) & (tensor <= 1)).all()
+    full = controller.kv_fit_am(
+        "AMfull",
+        q_export="R",
+        budget_tokens=4,
+        request_id="ctx",
+        expected_cursor=CTX,
+        key_range=[0, 4],
+        protected=[0],
+    )
+    assert full["method"]["name"].startswith(
+        "am_rmskeys_ols_nobias_uniform_offpolicy_framefixed"
+    )
+    assert full["method"]["params"]["identity_shortcut"] == {name: True for name in FA}
+    assert (
+        full["method"]["params"]["solver"]
+        and full["method"]["params"]["accumulate_dtype"]
+    )
+    rows = controller.kv_store.snapshot_rows("AMfull")
+    for name in FA:
+        assert torch.equal(rows[name], cache_rows(layers[name], range(4)))
+        assert (
+            full["method"]["params"]["output_error_after_cast"][name]["max_rel"] < 1e-5
+        )
+    partial = controller.kv_fit_am(
+        "AM2",
+        q_export="R",
+        budget_tokens=2,
+        request_id="ctx",
+        expected_cursor=CTX,
+        key_range=[0, 4],
+        protected=[0],
+    )
+    assert partial["method"]["params"]["frame_policy"] == "fixed"
+    assert partial["method"]["params"]["fixed_tokens"] == {name: [0] for name in FA}
+    for name in FA:
+        stored = controller.kv_store.snapshot_rows("AM2")[name]
+        assert torch.equal(
+            stored[0], cache_rows(layers[name], [0])[0]
+        )  # frozen frame row
+        error = partial["method"]["params"]["output_error_after_cast"][name]
+        assert 0.0 <= error["max_rel"] < 10.0
+    metadata = {
+        name: NS(
+            block_table=controller.runner.input_batch.block_table[0].get_cpu_tensor()
+        )
+        for name in FA
+    }
+    controller.kv_store.restore("AM2", "fresh", 1, metadata, 2)
+
+
+# ------------------------------------------------------------------ subset
+
+
+def test_kv_subset_slices_an_existing_snapshot_without_a_cache_pass(fakes):
+    controller, layers = resident_controller()
+    full = controller.kv_capture(
+        {"name": "full", "token_indices": list(range(CTX))}, "ctx", expected_cursor=CTX
+    )
+    controller._position_rules["ctx"] = (0, 0)
+    method = {
+        "name": "h2o_uniform_prefill",
+        "params": {"budget_tokens": 3},
+        "inputs": {},
+    }
+    for layer in layers.values():
+        layer.kv_cache.fill_(
+            -5
+        )  # the subset must come from the snapshot, not the cache
+    receipt = controller.kv_subset(
+        "sub", source_snapshot="full", token_indices=[0, 4, 5], method=method
+    )
+    assert receipt["selection_policy"] == "shared" and receipt["token_indices"] == [
+        0,
+        4,
+        5,
+    ]
+    assert receipt["retained_tokens"] == 3 and receipt["synthetic"] is False
+    assert (receipt["source_cursor"], receipt["source_position_offset"]) == (CTX, 0)
+    assert receipt["request_id"] == "ctx" and receipt["method"] == method
+    assert receipt["derived_from"] == {
+        "name": "full",
+        "digest": full["digest"],
+        "retained_tokens": CTX,
+        "selection_policy": "shared",
+        "synthetic": False,
+    }
+    assert receipt["digest_verified_at"] == "subset"
+    for name in FA:
+        rows = controller.kv_store.snapshot_rows("full")[name][torch.tensor([0, 4, 5])]
+        assert torch.equal(controller.kv_store.snapshot_rows("sub")[name], rows)
+    per_layer = controller.kv_subset(
+        "pl",
+        source_snapshot="full",
+        layer_token_indices={"fa0": [1, 2], "fa1": [3, 5]},
+        method=method,
+    )
+    assert (
+        per_layer["selection_policy"] == "per_layer"
+        and per_layer["token_indices"] is None
+    )
+    assert torch.equal(
+        controller.kv_store.snapshot_rows("pl")["fa1"],
+        controller.kv_store.snapshot_rows("full")["fa1"][torch.tensor([3, 5])],
+    )
+    # A subset of a subset keeps the chain and the mutation-free source.
+    nested = controller.kv_subset(
+        "nested", source_snapshot="sub", token_indices=[4], method=method
+    )
+    assert nested["derived_from"]["name"] == "sub" and nested["retained_tokens"] == 1
+    assert controller.kv_store.audit("full")["digest"] == full["digest"]
+    # Import through the unchanged restore path.
+    metadata = {
+        name: NS(
+            block_table=controller.runner.input_batch.block_table[0].get_cpu_tensor()
+        )
+        for name in FA
+    }
+    controller.kv_store.restore("sub", "fresh", 1, metadata, 3)
+    for name in FA:
+        assert torch.equal(
+            layers[name].kv_cache[3, :, :3, :].transpose(0, 1),
+            controller.kv_store.snapshot_rows("sub")[name],
+        )
+    # The selection's ready-made method record can be used directly.
+    fill_export(controller, "Q", [0, 6])
+    for layer in layers.values():
+        layer.kv_cache.copy_(fa_layer(0, "x").kv_cache)
+    controller.kv_score(
+        "S", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    selection = controller.kv_select(
+        "sel", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+    )
+    materialised = controller.kv_subset(
+        "sel_rows",
+        source_snapshot="full",
+        token_indices=selection["token_indices"],
+        method=selection["method"],
+    )
+    assert materialised["method"]["name"] == "h2o_uniform_prefill"
+    assert materialised["layer_token_indices"] == selection["layer_token_indices"]
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        (dict(token_indices=[0, 9]), "indices"),
+        (dict(token_indices=[0, 3]), "not in the source snapshot"),
+        (dict(layer_token_indices={"fa0": [0, 1], "fa1": [0]}), "equal counts"),
+        (dict(layer_token_indices={"fa0": [0, 1]}), "every FA layer"),
+        (
+            dict(token_indices=[0], layer_token_indices={"fa0": [0], "fa1": [0]}),
+            "not both",
+        ),
+        (dict(), "not both"),
+        (dict(token_indices=[0], method={"name": "x"}), "method must carry"),
+        (dict(token_indices=[0], source_snapshot="ghost"), "Unknown KV snapshot"),
+        (dict(token_indices=[0], name_out="src"), "overwritten"),
+    ],
+)
+def test_kv_subset_rejects_bad_selections_sources_and_methods(kwargs, message):
+    controller, layers = resident_controller()
+    controller.kv_capture(
+        {"name": "src", "token_indices": [0, 1, 2, 4, 5]}, "ctx", expected_cursor=CTX
+    )
+    call = dict(
+        name_out="sub",
+        source_snapshot="src",
+        method={"name": "ev", "params": {}, "inputs": {}},
+    )
+    call.update(kwargs)
+    name_out = call.pop("name_out")
+    with pytest.raises(ValueError, match=message):
+        controller.kv_subset(name_out, **call)
+    assert set(controller.kv_store.list()["snapshots"]) == {"src"}
+    controller.arm(
+        expected_prompt_tokens=9, capture_kv={"name": "pending", "token_indices": [0]}
+    )
+    with pytest.raises(CompactionContractError, match="reserved by another operation"):
+        controller.kv_subset(
+            "pending",
+            source_snapshot="src",
+            token_indices=[0],
+            method={"name": "ev", "params": {}, "inputs": {}},
+        )
+
+
+def test_subset_of_a_synthetic_snapshot_stays_synthetic(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    controller.kv_fit_am(
+        "AM",
+        q_export="Q",
+        budget_tokens=3,
+        request_id="ctx",
+        expected_cursor=CTX,
+        protected=[1],
+    )
+    sub = controller.kv_subset(
+        "AMsub",
+        source_snapshot="AM",
+        token_indices=[1, 5],
+        method={"name": "am_then_evict", "params": {}, "inputs": {}},
+    )
+    assert sub["synthetic"] is True and sub["derived_from"]["synthetic"] is True
+    for name in FA:
+        rows = controller.kv_store.snapshot_rows("AM")[name][torch.tensor([0, 2])]
+        assert torch.equal(controller.kv_store.snapshot_rows("AMsub")[name], rows)
