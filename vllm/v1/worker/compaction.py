@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -826,10 +827,18 @@ class BoundaryOperation:
         return "offset_after_intervention" if self.position_offset else "reset"
 
     def result(self) -> dict:
-        if self.failed or not self.prompt_complete or self._pending_tokens is not None:
-            raise CompactionContractError(
-                self.failed or "The prompt-end boundary was not reached"
+        if self.failed:
+            # Report the failure, then close so the controller can arm again;
+            # later calls say the operation is already closed.
+            message = (
+                f"Operation already closed after failure: {self.failed}"
+                if self.closed
+                else self.failed
             )
+            self.closed = True
+            raise CompactionContractError(message)
+        if not self.prompt_complete or self._pending_tokens is not None:
+            raise CompactionContractError("The prompt-end boundary was not reached")
         self.closed = True
         return copy.deepcopy(
             {
@@ -953,6 +962,7 @@ class NativeCompactionController:
     _export_plan: Any = None
     _consumed: Any = None  # request_id -> cursor after its last successful forward
     _pending_consumed: Any = None
+    _provenance_cache: Any = None
 
     def __init__(self, runner: GPUModelRunner):
         validate_configuration(runner.vllm_config)
@@ -1300,31 +1310,49 @@ class NativeCompactionController:
         return {**self.info(), **self.operation.result()}
 
     def results(self, operation_ids: list[str]) -> dict:
+        """Close and return completed operations; failed ones are retired once.
+
+        A failed operation is reported in the raised error and removed, leaving
+        a tombstone so later forwards of a still-live request run
+        uninstrumented instead of wedging the controller until restart.
+        """
         if len(set(operation_ids)) != len(operation_ids):
             raise CompactionContractError("Duplicate operation_ids")
+        failed = {}
         for operation_id in operation_ids:
             operation = self.operations.get(operation_id)
             if operation is None:
                 raise CompactionContractError(f"Unknown operation: {operation_id}")
-            if (
-                operation.failed
-                or not operation.prompt_complete
-                or operation._pending_tokens is not None
-            ):
+            if operation.failed:
+                failed[operation_id] = operation.failed
+            elif not operation.prompt_complete or operation._pending_tokens is not None:
                 raise CompactionContractError(
-                    operation.failed or "Operation has not reached its prompt end"
+                    f"Operation has not reached its prompt end: {operation_id}"
                 )
+        if failed:
+            for operation_id in failed:
+                operation = self.operations[operation_id]
+                operation.closed = True
+                self._retire(operation_id, operation)
+            raise CompactionContractError(
+                "Failed operations retired: "
+                + "; ".join(f"{key}: {text}" for key, text in failed.items())
+            )
         receipts = {
             key: {**self.info(), **self.operations[key].result()}
             for key in operation_ids
         }
         for key in operation_ids:
-            operation = self.operations.pop(key)
-            if operation.request_finished:
-                self._descriptors.pop(key, None)
-            else:
-                self._retired_bindings[operation.request_id] = key
+            self._retire(key, self.operations[key])
         return receipts
+
+    def _retire(self, key: str, operation: BoundaryOperation) -> None:
+        self.operations.pop(key, None)
+        request_id = operation.request_id or operation.expected_request_id
+        if operation.request_finished or request_id is None:
+            self._descriptors.pop(key, None)
+        else:
+            self._retired_bindings[request_id] = key
 
     def snapshots(self) -> dict:
         return self.store.list()["snapshots"]
@@ -1911,14 +1939,26 @@ class NativeCompactionController:
         row, metadata, computed = self._resident(
             request_id, expected_cursor=expected_cursor
         )
-        return self.kv_store.capture(
-            spec,
-            request_id,
-            row,
-            metadata,
-            computed,
-            source_position_offset=self._position_offset(request_id, computed),
-        )
+        with self._store_errors():
+            return self.kv_store.capture(
+                spec,
+                request_id,
+                row,
+                metadata,
+                computed,
+                source_position_offset=self._position_offset(request_id, computed),
+            )
+
+    @staticmethod
+    @contextmanager
+    def _store_errors():
+        """Surface the KV store's ``ValueError``s as the one RPC error type."""
+        try:
+            yield
+        except CompactionContractError:
+            raise
+        except ValueError as error:
+            raise CompactionContractError(str(error)) from error
 
     def kv_subset(
         self,
@@ -1945,13 +1985,14 @@ class NativeCompactionController:
             raise CompactionContractError(
                 "KV capture name is reserved by another operation"
             )
-        return self.kv_store.subset(
-            name_out,
-            source_snapshot,
-            method=method,
-            token_indices=token_indices,
-            layer_token_indices=layer_token_indices,
-        )
+        with self._store_errors():
+            return self.kv_store.subset(
+                name_out,
+                source_snapshot,
+                method=method,
+                token_indices=token_indices,
+                layer_token_indices=layer_token_indices,
+            )
 
     def _kv_layer_source(
         self,
@@ -2099,6 +2140,16 @@ class NativeCompactionController:
         return list(protected)
 
     # ------------------------------------------------------------ compute ops
+    def _provenance(self) -> dict:
+        """Library provenance computed once per controller (git is shelled out)."""
+        compaction_q = _q_module()
+        if self._provenance_cache is None:
+            self._provenance_cache = compaction_q.library_provenance()
+        return {
+            **self._provenance_cache,
+            "registered_override": sorted(compaction_q._REGISTRY),
+        }
+
     def _budget(self, params: dict) -> dict:
         device = next(iter(self.kv_store.layers.values())).kv_cache.device
         return _q_module().memory_budget(device, params.get("memory_budget_bytes"))
@@ -2138,9 +2189,22 @@ class NativeCompactionController:
             raise CompactionContractError(f"Unknown scoring method: {method}")
         params = compaction_q._check_params(
             params,
-            {"chunk", "scale", "context_only_normalisation", "memory_budget_bytes"},
+            {
+                "chunk",
+                "scale",
+                "context_only_normalisation",
+                "memory_budget_bytes",
+                "repeat_prompt",
+            },
             "score",
         )
+        repeat_prompt = params.get("repeat_prompt")
+        if repeat_prompt is not None and (
+            method != "kvzip" or not isinstance(repeat_prompt, str) or not repeat_prompt
+        ):
+            raise CompactionContractError(
+                "repeat_prompt must be a nonempty string and applies to kvzip only"
+            )
         if not isinstance(name_out, str) or not name_out:
             raise CompactionContractError("Score names must be nonempty")
         if name_out in self.score_store._entries:
@@ -2148,6 +2212,11 @@ class NativeCompactionController:
         q_entry, q_tensors, q_cursors = self._q_source(q_export)
         q_start, q_end = q_entry["token_range"]
         context_only = bool(params.get("context_only_normalisation"))
+        if method == "kvzip" and q_start == 0:
+            raise CompactionContractError(
+                "kvzip repeat range cannot start at 0: there are no cached keys "
+                "before the repeat input to score"
+            )
         if method == "kvzip" and request_id is not None and not context_only:
             if key_range is None:
                 key_range = [0, q_start]
@@ -2166,11 +2235,15 @@ class NativeCompactionController:
         if (
             method == "h2o"
             and kv_snapshot is not None
-            and q_entry["request_id"] != source.get("request_id")
+            and (
+                q_entry["request_id"] is None
+                or source.get("request_id") is None
+                or q_entry["request_id"] != source.get("request_id")
+            )
         ):
             raise CompactionContractError(
                 "h2o with a kv_snapshot source requires the query export and the "
-                "snapshot to come from the same request"
+                "snapshot to come from the same (known) request"
             )
         k_ref_reader = None
         k_ref_info = None
@@ -2354,7 +2427,7 @@ class NativeCompactionController:
                 "scores_digest": described["digest"],
                 "q_export": described["q_export"],
                 "source": described["source"],
-                "library": compaction_q.library_provenance(),
+                "library": self._provenance(),
             },
         }
         capture_spec = (
@@ -2409,7 +2482,8 @@ class NativeCompactionController:
 
     def kv_describe(self, name: str) -> dict:
         """One KV snapshot's metadata (no tensors), without listing the store."""
-        return self.kv_store.describe(name)
+        with self._store_errors():
+            return self.kv_store.describe(name)
 
     def q_describe(self, name: str) -> dict:
         """One query export's metadata (no tensors), without listing the store."""
@@ -2465,13 +2539,15 @@ class NativeCompactionController:
         if name_out in self.kv_store._entries:
             raise CompactionContractError("KV snapshot names cannot be overwritten")
         refit_protected = params.get("refit_protected", False)
-        want_output_error = params.get("output_error", True)
+        output_error_setting = params.get("output_error")
         if not isinstance(refit_protected, bool) or not isinstance(
-            want_output_error, bool
+            output_error_setting, (bool, type(None))
         ):
             raise CompactionContractError(
-                "refit_protected and output_error must be bools"
+                "refit_protected must be a bool and output_error a bool or None"
             )
+        want_output_error = None
+        output_error_policy = None
         protected_tokens = self._protected_tokens(protected)
         q_entry, q_tensors, _ = self._q_source(q_export)
         source, rows = self._kv_layer_source(
@@ -2515,9 +2591,22 @@ class NativeCompactionController:
             casts.add(f"{fitted32.dtype}->{values.dtype}")
             cast_errors[name] = compaction_q.cast_error(fitted32, fitted)
             k_c = fit["k_c"].to(device=keys.device, dtype=keys.dtype)
+            if want_output_error is None:
+                threshold = compaction_q.OUTPUT_ERROR_MAX_TOKENS
+                if output_error_setting is None:
+                    want_output_error = int(keys.shape[0]) <= threshold
+                    output_error_policy = (
+                        f"default_{'on' if want_output_error else 'off'}"
+                        f"_threshold_{threshold}_tokens"
+                    )
+                else:
+                    want_output_error = output_error_setting
+                    output_error_policy = "caller"
             if want_output_error:
-                chunk = fit["summary"].get("chunk") or compaction_q.DEFAULT_CHUNK
-                group = int(q_ref.shape[1]) // int(keys.shape[1])
+                # Free memory is sampled now, with the layer's inputs on device.
+                error_budget = compaction_q.memory_budget(
+                    keys.device, params.get("memory_budget_bytes")
+                )
                 output_errors[name] = compaction_q.attention_output_error(
                     q_ref,
                     keys,
@@ -2525,8 +2614,9 @@ class NativeCompactionController:
                     k_c,
                     fitted,
                     scale=scales[name],
-                    rows_per_block=int(chunk) * group,
+                    budget_bytes=int(error_budget["bytes"]),
                 )
+                output_errors[name]["memory_budget"] = error_budget
             variants.add(fit["variant"])
             diagnostics[name] = fit["diagnostics"]
             summaries[name] = fit["summary"]
@@ -2571,7 +2661,13 @@ class NativeCompactionController:
                 "fit_value_dtype": "torch.float32",
                 "values_cast": sorted(casts),
                 "cast_error": cast_errors,
-                "output_error_after_cast": output_errors if want_output_error else None,
+                "output_error_after_cast_in_sample": (
+                    output_errors if want_output_error else None
+                ),
+                "output_error_policy": output_error_policy,
+                "output_error_note": (
+                    "in-sample: measured on the same reference queries as the fit"
+                ),
                 "output_error_after_rel_library": {
                     n: s.get("output_error_after_rel") for n, s in summaries.items()
                 },
@@ -2588,7 +2684,7 @@ class NativeCompactionController:
                 "query_convention": q_entry["query_convention"],
                 "source": source,
                 "kv_digests": kv_digests if digest_inputs else None,
-                "library": compaction_q.library_provenance(),
+                "library": self._provenance(),
             },
             "diagnostics": diagnostics,
         }

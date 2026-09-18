@@ -749,6 +749,7 @@ class FakeScores:
         chunk=2048,
         normalisation="paper",
         memory_budget_bytes=None,
+        repeat_prompt=None,
     ):
         self.calls.append(
             dict(
@@ -760,13 +761,18 @@ class FakeScores:
                 chunk=chunk,
                 normalisation=normalisation,
                 memory_budget_bytes=memory_budget_bytes,
+                repeat_prompt=repeat_prompt,
             )
         )
         variant = "kvzip_uniform_perlayer_fullctx"
         if normalisation == "context_only":
             variant += "_ctxonly"
         return score_result(
-            k.float().abs().sum(-1).T, variant, chunk=chunk, normalisation=normalisation
+            k.float().abs().sum(-1).T,
+            variant,
+            chunk=chunk,
+            normalisation=normalisation,
+            repeat_prompt=repeat_prompt,
         )
 
 
@@ -1180,7 +1186,7 @@ def test_h2o_with_a_snapshot_source_requires_the_exports_request(fakes):
         "S", q_export="Q", method="h2o", kv_snapshot="mine", expected_cursor=CTX
     )
     assert ok["source"]["kind"] == "kv_snapshot" and ok["source"]["request_id"] == "ctx"
-    with pytest.raises(CompactionContractError, match="same request"):
+    with pytest.raises(CompactionContractError, match="same .known. request"):
         controller.kv_score(
             "S2", q_export="Q", method="h2o", kv_snapshot="theirs", expected_cursor=CTX
         )
@@ -1231,6 +1237,7 @@ def test_kv_select_requires_policy_and_aggregate_and_returns_a_method_record(fak
         "package",
         "path",
         "commit",
+        "library_commit",
         "dirty",
         "registered_override",
         "error",
@@ -1333,7 +1340,7 @@ def test_kv_fit_am_freezes_frame_tokens_and_records_fit_metadata(fakes):
     assert params["blocking"] == {name: {"memory_budget_bytes": 1 << 30} for name in FA}
     assert params["identity_shortcut"] == {name: False for name in FA}
     for name in FA:
-        error = params["output_error_after_cast"][name]
+        error = params["output_error_after_cast_in_sample"][name]
         assert len(error["rel"]) == KV_HEADS and error["max_rel"] >= 0.0
     assert params["output_error_after_rel_library"] == {name: [0.0, 0.0] for name in FA}
     assert params["library_warnings"] == {name: ["fake-am-warning"] for name in FA}
@@ -1389,7 +1396,7 @@ def test_kv_fit_am_freezes_frame_tokens_and_records_fit_metadata(fakes):
     assert fakes.am.calls[-1]["fixed"] == [] and fakes.am.calls[-1]["protected"] == [1]
     assert refit["method"]["params"]["frame_policy"] == "refit"
     assert refit["method"]["params"]["fixed_tokens"] == {name: [] for name in FA}
-    assert refit["method"]["params"]["output_error_after_cast"] is None
+    assert refit["method"]["params"]["output_error_after_cast_in_sample"] is None
     assert set(refit["method"]["inputs"]["kv_digests"]) == set(FA)
     assert isinstance(refit["method"]["inputs"]["q_digest"], str)
     assert refit["method"]["inputs"]["q_digest_policy"] == "computed"
@@ -1692,7 +1699,10 @@ def test_real_methods_library_contract_on_tiny_tensors():
     for name in FA:
         assert torch.equal(rows[name], cache_rows(layers[name], range(4)))
         assert (
-            full["method"]["params"]["output_error_after_cast"][name]["max_rel"] < 1e-5
+            full["method"]["params"]["output_error_after_cast_in_sample"][name][
+                "max_rel"
+            ]
+            < 1e-5
         )
     partial = controller.kv_fit_am(
         "AM2",
@@ -1710,7 +1720,7 @@ def test_real_methods_library_contract_on_tiny_tensors():
         assert torch.equal(
             stored[0], cache_rows(layers[name], [0])[0]
         )  # frozen frame row
-        error = partial["method"]["params"]["output_error_after_cast"][name]
+        error = partial["method"]["params"]["output_error_after_cast_in_sample"][name]
         assert 0.0 <= error["max_rel"] < 10.0
     metadata = {
         name: NS(
@@ -1934,3 +1944,280 @@ def test_per_name_describe_returns_one_entry_without_listing(fakes):
     assert export == controller.q_exports()["exports"]["Q"]
     with pytest.raises(CompactionContractError, match="Unknown query export"):
         controller.q_describe("ghost")
+
+
+# ------------------------------------------------------------- final pass
+
+
+def test_failed_legacy_operation_closes_on_result_so_the_controller_can_rearm():
+    requests = [("r", 0, 3, None, 2)]
+    controller, layers, _ = make_controller(requests)
+    controller.arm(expected_prompt_tokens=3)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    controller.before_forward(metadata, positions, counts)
+    controller.fail_forward(RuntimeError("kernel failed"))
+    with pytest.raises(CompactionContractError, match="Call cc_result"):
+        controller.arm(expected_prompt_tokens=3)
+    failed = controller.operation
+    with pytest.raises(CompactionContractError, match="kernel failed"):
+        controller.result()
+    assert failed.closed
+    with pytest.raises(CompactionContractError, match="already closed"):
+        failed.result()
+    # The reviewer's reproduction: cc_arm must work again without a restart.
+    armed = controller.arm(expected_prompt_tokens=3)
+    assert armed["armed"] and controller.operation is not failed
+    # An ingest aborted before its prompt end takes the same path.
+    controller.before_forward(metadata, positions, counts)
+    controller.finish_requests({"r"})
+    with pytest.raises(CompactionContractError, match="aborted"):
+        controller.result()
+    assert controller.arm(expected_prompt_tokens=3)["armed"]
+    # A live, unfinished operation still blocks re-arming.
+    boundary = controller.before_forward(metadata, positions, counts)
+    with pytest.raises(CompactionContractError, match="Call cc_result"):
+        controller.arm(expected_prompt_tokens=3)
+    controller.after_forward(boundary)
+    assert controller.result()["forward_calls"] == 1
+
+
+def test_failed_descriptor_operations_are_retired_once_by_results():
+    desc = dict(operation_id="a", expected_prompt_tokens=5)
+    requests = [("r", 0, 2, desc, 2)]
+    controller, layers, _ = make_controller(requests)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    controller.before_forward(metadata, positions, counts)
+    controller.fail_forward(RuntimeError("kernel failed"))
+    with pytest.raises(
+        CompactionContractError, match="retired: a: RuntimeError: kernel"
+    ):
+        controller.results(["a"])
+    assert controller.operations == {}
+    with pytest.raises(CompactionContractError, match="Unknown operation"):
+        controller.results(["a"])
+    # The request lives on: its next forward with the same descriptor runs
+    # uninstrumented (tombstone) instead of raising.
+    requests = [("r", 2, 3, desc, 2)]
+    advance(controller, requests)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    assert controller.before_forward(metadata, positions, counts) is None
+    controller.after_forward(None)
+    assert controller._consumed == {"r": 5}
+    controller.finish_requests({"r"})
+    assert controller._retired_bindings == {} and controller._descriptors == {}
+    # An unfailed, incomplete operation is still reported as such (not retired).
+    other = dict(operation_id="b", expected_prompt_tokens=5)
+    requests = [("s", 0, 2, other, 3)]
+    controller.runner.requests["s"] = NS(
+        mm_features=[],
+        prompt_embeds=None,
+        lora_request=None,
+        num_computed_tokens=0,
+        num_prompt_tokens=5,
+        sampling_params=NS(extra_args={DESCRIPTOR_KEY: other}),
+    )
+    advance(controller, requests)
+    metadata, positions, counts = forward_inputs(requests, controller)
+    controller.after_forward(controller.before_forward(metadata, positions, counts))
+    with pytest.raises(CompactionContractError, match="not reached its prompt end: b"):
+        controller.results(["b"])
+    assert "b" in controller.operations
+
+
+def test_output_error_blocks_follow_the_budget_and_wrap_device_oom(monkeypatch):
+    generator = torch.Generator().manual_seed(1)
+    q = torch.randn(7, Q_HEADS, HEAD, generator=generator)
+    k = torch.randn(9, KV_HEADS, HEAD, generator=generator)
+    v = torch.randn(9, KV_HEADS, HEAD, generator=generator)
+    k_c, v_c = k[[0, 3, 8]], v[[0, 3, 8]] * 1.1
+    scale = HEAD**-0.5
+    wide = compaction_q.attention_output_error(q, k, v, k_c, v_c, scale=scale)
+    tiny = compaction_q.attention_output_error(
+        q, k, v, k_c, v_c, scale=scale, budget_bytes=3 * (9 + 3) * 4 * 5
+    )
+    # rows_per_block = budget // (3 * (T + t) * 4) = 5 grouped rows -> 2 queries * G.
+    assert (
+        tiny["rows_per_block"] == 2 * (Q_HEADS // KV_HEADS)
+        and tiny["budget_bytes"] == 720
+    )
+    assert wide["rows_per_block"] == max(1, (1 << 30) // (3 * 12 * 4)) // 2 * 2
+    assert wide["rel"] == pytest.approx(tiny["rel"], rel=1e-5)
+    assert wide["max_rel"] > 0.0 and len(wide["abs"]) == KV_HEADS
+    with pytest.raises(CompactionContractError, match="budget_bytes must be"):
+        compaction_q.attention_output_error(
+            q, k, v, k_c, v_c, scale=scale, budget_bytes=0
+        )
+
+    def oom(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 512.00 MiB")
+
+    monkeypatch.setattr(compaction_q.torch, "softmax", oom)
+    with pytest.raises(CompactionContractError, match="ran out of memory"):
+        compaction_q.attention_output_error(q, k, v, k_c, v_c, scale=scale)
+
+    def other(*args, **kwargs):
+        raise RuntimeError("some other kernel failure")
+
+    monkeypatch.setattr(compaction_q.torch, "softmax", other)
+    with pytest.raises(RuntimeError, match="some other kernel failure"):
+        compaction_q.attention_output_error(q, k, v, k_c, v_c, scale=scale)
+
+
+def test_output_error_default_depends_on_the_context_length(fakes, monkeypatch):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    common = dict(q_export="Q", budget_tokens=2, request_id="ctx", expected_cursor=CTX)
+    monkeypatch.setattr(compaction_q, "OUTPUT_ERROR_MAX_TOKENS", 4)
+    off = controller.kv_fit_am("off", **common)["method"]["params"]
+    assert off["output_error_after_cast_in_sample"] is None
+    assert off["output_error_policy"] == "default_off_threshold_4_tokens"
+    assert off["output_error_note"].startswith("in-sample")
+    forced = controller.kv_fit_am("on", params={"output_error": True}, **common)
+    params = forced["method"]["params"]
+    assert params["output_error_policy"] == "caller"
+    for name in FA:
+        error = params["output_error_after_cast_in_sample"][name]
+        assert error["memory_budget"]["policy"] == "default_1GiB"
+        assert error["rows_per_block"] >= 1 and len(error["rel"]) == KV_HEADS
+    monkeypatch.setattr(compaction_q, "OUTPUT_ERROR_MAX_TOKENS", 6)
+    default_on = controller.kv_fit_am("on2", **common)["method"]["params"]
+    assert default_on["output_error_policy"] == "default_on_threshold_6_tokens"
+    assert default_on["output_error_after_cast_in_sample"] is not None
+    with pytest.raises(CompactionContractError, match="bool or None"):
+        controller.kv_fit_am("bad", params={"output_error": 1}, **common)
+
+
+def test_library_provenance_is_cached_per_controller_and_names_the_library_commit(
+    fakes, monkeypatch
+):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    controller.kv_score(
+        "S", q_export="Q", method="h2o", request_id="ctx", expected_cursor=CTX
+    )
+    calls = []
+    real_run = compaction_q.subprocess.run
+
+    def counting_run(*args, **kwargs):
+        calls.append(args[0][:3])
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(compaction_q.subprocess, "run", counting_run)
+    first = controller.kv_select(
+        "a", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+    )
+    controller.kv_select(
+        "b", scores="S", budget_tokens=3, policy="shared", aggregate="max"
+    )
+    library = first["method"]["inputs"]["library"]
+    assert set(library) >= {"package", "path", "commit", "library_commit", "dirty"}
+    assert library["registered_override"] == ["am", "scores", "select"]
+    git_calls = [c for c in calls if c and c[0] == "git"]
+    # Shelled out once per controller (rev-parse, status, log), not per call.
+    assert len(git_calls) in (0, 3)
+    if library["commit"] is not None:
+        assert len(library["commit"]) == 40 and len(library["library_commit"]) == 40
+    controller._provenance_cache = {"package": "x", "commit": "cached"}
+    cached = controller.kv_select(
+        "c", scores="S", budget_tokens=2, policy="shared", aggregate="max"
+    )
+    assert cached["method"]["inputs"]["library"]["commit"] == "cached"
+
+
+def test_h2o_snapshot_check_treats_unknown_request_ids_as_a_mismatch(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6], request_id=None)  # unbound export
+    row, metadata, computed = controller._resident("ctx", expected_cursor=CTX)
+    controller.kv_store.capture(
+        {"name": "known", "token_indices": [0, 1]}, "ctx", row, metadata, computed
+    )
+    controller.kv_store.register(
+        "anon",
+        {name: torch.zeros(2, KV_HEADS, 2 * HEAD) for name in FA},
+        source_cursor=CTX,
+        source_position_offset=0,
+        retained_tokens=2,
+        method={"name": "x", "params": {}, "inputs": {}},
+        token_indices=[0, 1],
+    )
+    for snapshot in ("known", "anon"):
+        with pytest.raises(CompactionContractError, match="same \\(known\\) request"):
+            controller.kv_score(
+                "S",
+                q_export="Q",
+                method="h2o",
+                kv_snapshot=snapshot,
+                expected_cursor=CTX,
+            )
+
+
+def test_kvzip_repeat_range_cannot_start_at_zero(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [0, 6])
+    with pytest.raises(CompactionContractError, match="cannot start at 0"):
+        controller.kv_score(
+            "Z", q_export="Q", method="kvzip", request_id="ctx", expected_cursor=CTX
+        )
+
+
+def test_store_errors_surface_as_the_single_contract_error_type(fakes):
+    controller, layers = resident_controller()
+    controller.kv_capture(
+        {"name": "src", "token_indices": [0, 1]}, "ctx", expected_cursor=CTX
+    )
+    with pytest.raises(CompactionContractError, match="indices") as capture_error:
+        controller.kv_capture(
+            {"name": "bad", "token_indices": [9]}, "ctx", expected_cursor=CTX
+        )
+    assert capture_error.type is CompactionContractError
+    with pytest.raises(
+        CompactionContractError, match="Unknown KV snapshot"
+    ) as subset_error:
+        controller.kv_subset(
+            "sub",
+            source_snapshot="ghost",
+            token_indices=[0],
+            method={"name": "x", "params": {}, "inputs": {}},
+        )
+    assert subset_error.type is CompactionContractError
+    with pytest.raises(
+        CompactionContractError, match="Unknown KV snapshot"
+    ) as describe_error:
+        controller.kv_describe("ghost")
+    assert describe_error.type is CompactionContractError
+
+
+def test_repeat_prompt_is_forwarded_verbatim_for_kvzip_only(fakes):
+    controller, layers = resident_controller()
+    fill_export(controller, "Q", [4, 6])
+    wording = "Repeat the previous context exactly:"
+    receipt = controller.kv_score(
+        "Z",
+        q_export="Q",
+        method="kvzip",
+        request_id="ctx",
+        expected_cursor=CTX,
+        params={"repeat_prompt": wording},
+    )
+    assert receipt["params"]["repeat_prompt"] == wording
+    assert receipt["library_params"]["fa0"]["repeat_prompt"] == wording
+    assert all(call["repeat_prompt"] == wording for call in fakes.scores.calls)
+    fill_export(controller, "H", [0, 6])
+    with pytest.raises(CompactionContractError, match="kvzip only"):
+        controller.kv_score(
+            "S",
+            q_export="H",
+            method="h2o",
+            request_id="ctx",
+            expected_cursor=CTX,
+            params={"repeat_prompt": wording},
+        )
+    with pytest.raises(CompactionContractError, match="nonempty string"):
+        controller.kv_score(
+            "Z2",
+            q_export="Q",
+            method="kvzip",
+            request_id="ctx",
+            expected_cursor=CTX,
+            params={"repeat_prompt": ""},
+        )

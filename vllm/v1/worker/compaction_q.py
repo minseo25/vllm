@@ -816,6 +816,7 @@ def library_provenance() -> dict:
         "package": METHODS_PACKAGE,
         "path": None,
         "commit": None,
+        "library_commit": None,
         "dirty": None,
         "registered_override": sorted(_REGISTRY),
         "error": None,
@@ -842,6 +843,13 @@ def library_provenance() -> dict:
             timeout=10,
             check=False,
         )
+        last = subprocess.run(
+            ["git", "-C", path, "log", "-1", "--format=%H", "--", "."],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
     except (OSError, subprocess.SubprocessError) as error:
         info["error"] = f"{type(error).__name__}: {error}"
         return info
@@ -851,6 +859,8 @@ def library_provenance() -> dict:
         info["error"] = commit.stderr.strip() or "git rev-parse failed"
     if status.returncode == 0:
         info["dirty"] = bool(status.stdout.strip())
+    if last.returncode == 0 and last.stdout.strip():
+        info["library_commit"] = last.stdout.strip()
     return info
 
 
@@ -944,6 +954,9 @@ def score_layer(
             raise CompactionContractError(
                 "k_ref must be [R, Hkv, D] aligned with q_ref"
             )
+        extra = {}
+        if params.get("repeat_prompt") is not None:
+            extra["repeat_prompt"] = params["repeat_prompt"]  # recorded verbatim
         result = _call_library(
             "scores",
             "kvzip_scores",
@@ -953,6 +966,7 @@ def score_layer(
             k_ref=k_ref,
             normalisation=normalisation,
             **blocking,
+            **extra,
         )
     scores, variant, library_params, warnings = _unwrap_scores(result, method)
     if (
@@ -1214,6 +1228,9 @@ def cast_error(reference: torch.Tensor, cast: torch.Tensor) -> dict:
     }
 
 
+OUTPUT_ERROR_MAX_TOKENS = 65536  # default the post-cast error pass off above this
+
+
 def attention_output_error(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1222,44 +1239,74 @@ def attention_output_error(
     v_c: torch.Tensor,
     *,
     scale: float,
-    rows_per_block: int = DEFAULT_CHUNK,
+    budget_bytes: int = DEFAULT_MEMORY_BUDGET_BYTES,
 ) -> dict:
-    """Output error of the *stored* compacted rows against the full cache.
+    """In-sample output error of the *stored* compacted rows against the cache.
 
     Per kv head ``h`` (query heads ``h*G .. (h+1)*G-1``, contiguous GQA blocks) in
     float32: ``Y_ref = softmax(scale q K_h^T) V_h`` over all ``T`` keys and
     ``Y_c = softmax(scale q K_c^T) V_c`` over the retained rows exactly as they
-    will sit in the cache (after any dtype cast, no bias). Returns per-head
-    absolute and relative (``/ ||Y_ref||_F``) Frobenius errors and ``max_rel``.
-    Queries are processed in blocks of ``rows_per_block`` grouped rows.
+    will sit in the cache (after any dtype cast, no bias), for the same reference
+    queries the fit used. Memory: only per-head key/value slices and one query
+    block are cast to float32; the block holds ``rows_per_block =
+    budget_bytes // (3 * (T + t) * 4)`` grouped rows (two float32 logits blocks
+    plus slack, the library's ``chunk_for_budget`` rule with ``g = 1`` because
+    the grouped rows already fold ``G`` in). Device OOM becomes a contract error.
+    Returns per-head absolute/relative (``/ ||Y_ref||_F``) Frobenius errors,
+    ``max_rel``, ``rows_per_block`` and ``budget_bytes``.
     """
     if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape or k_c.shape != v_c.shape:
         raise CompactionContractError("output error needs q [R,Hq,D], k/v and k_c/v_c")
     heads, kv_heads = int(q.shape[1]), int(k.shape[1])
     if heads % kv_heads or k_c.shape[1] != kv_heads or k_c.shape[2] != k.shape[2]:
         raise CompactionContractError("output error: head layout mismatch")
-    if type(rows_per_block) is not int or rows_per_block < 1:
-        raise CompactionContractError("rows_per_block must be a positive integer")
+    if type(budget_bytes) is not int or budget_bytes < 1:
+        raise CompactionContractError("budget_bytes must be a positive integer")
     group = heads // kv_heads
-    q32, k32, v32 = q.detach().float(), k.detach().float(), v.detach().float()
-    kc32, vc32 = (
-        k_c.detach().float().to(k32.device),
-        v_c.detach().float().to(k32.device),
-    )
+    tokens, retained = int(k.shape[0]), int(k_c.shape[0])
+    rows_per_block = max(1, budget_bytes // (3 * (tokens + retained) * 4))
+    queries_per_block = max(1, rows_per_block // group)
+    device = k.device
     absolute, relative = [], []
-    for h in range(kv_heads):
-        rows = q32[:, h * group : (h + 1) * group, :].reshape(-1, q32.shape[2])
-        keys_h, values_h = k32[:, h, :], v32[:, h, :]
-        keys_c, values_c = kc32[:, h, :], vc32[:, h, :]
-        numerator = denominator = 0.0
-        for start in range(0, rows.shape[0], rows_per_block):
-            block = rows[start : start + rows_per_block]
-            y_ref = torch.softmax(block @ keys_h.T * scale, dim=-1) @ values_h
-            y_c = torch.softmax(block @ keys_c.T * scale, dim=-1) @ values_c
-            numerator += float(((y_ref - y_c) ** 2).sum())
-            denominator += float((y_ref**2).sum())
-        absolute.append(math.sqrt(numerator))
-        relative.append(
-            math.sqrt(numerator) / math.sqrt(denominator) if denominator > 0 else 0.0
-        )
-    return {"abs": absolute, "rel": relative, "max_rel": max(relative)}
+    try:
+        for h in range(kv_heads):
+            keys_h = k[:, h, :].detach().float()
+            values_h = v[:, h, :].detach().float()
+            keys_c = k_c[:, h, :].detach().to(device).float()
+            values_c = v_c[:, h, :].detach().to(device).float()
+            numerator = denominator = 0.0
+            for start in range(0, int(q.shape[0]), queries_per_block):
+                block = (
+                    q[start : start + queries_per_block, h * group : (h + 1) * group, :]
+                    .reshape(-1, int(q.shape[2]))
+                    .detach()
+                    .float()
+                )
+                y_ref = torch.softmax(block @ keys_h.T * scale, dim=-1) @ values_h
+                y_c = torch.softmax(block @ keys_c.T * scale, dim=-1) @ values_c
+                numerator += float(((y_ref - y_c) ** 2).sum())
+                denominator += float((y_ref**2).sum())
+            absolute.append(math.sqrt(numerator))
+            relative.append(
+                math.sqrt(numerator) / math.sqrt(denominator)
+                if denominator > 0
+                else 0.0
+            )
+    except RuntimeError as error:
+        if (
+            type(error).__name__ != "OutOfMemoryError"
+            and "out of memory" not in str(error).lower()
+        ):
+            raise
+        raise CompactionContractError(
+            f"output error pass ran out of memory (T={tokens}, t={retained}, "
+            f"rows_per_block={queries_per_block * group}, budget={budget_bytes} "
+            f"bytes): {error}"
+        ) from error
+    return {
+        "abs": absolute,
+        "rel": relative,
+        "max_rel": max(relative),
+        "rows_per_block": queries_per_block * group,
+        "budget_bytes": budget_bytes,
+    }
